@@ -20,10 +20,17 @@ SMMU stall or RPTR timeout. Still **not** Metal for SpringBoard (CA stays
 **Sources:** `tools/gpu-src/sweet_gpu.c` (+ `.0090.c` snap), `embed_fw.py`
 (GMU+SQE), `gen_0092_patch.py`. Docs: `GPU.md` mode 5, `METAL-PORT.md` B2.
 
-**Next:** commit + CI on `pro/gpu-bringup` → `shim-boot-0092-metal.img`
-(`sweetgpu=5`); `fastboot boot`; pull log for RING IDLE / SMMU_STALL.
-If SMMU stalls: Adreno SMMU bypass/map at `0x05040000`. Then GPU clear
-into splash PA.
+**CI + boot (2026-10-30):** commit `8fe29a0` on `gpu-bringup`. Run
+**40974111335** SUCCESS → `xnu/out-0092/kernel.development.sweet`.
+Image `shim/out/shim-boot-0092-metal.img` (= `D:\Sborrosuigay\…`,
+sha256 `b1475af563ab5f54f8bb481358f16ef00848c664be53fa04a4005210aaa1d50b`)
+cmdline = 0091 daily + `sweetgpu=5` (noconsole/cache/cpus=8). **Booted**
+2026-10-30 ~00:45 (`fastboot boot` OKAY). Await log:
+`SQE RING IDLE` / `SMMU_STALL` / `GMU CM3` / OOB lines.
+
+**Next:** pull log (`tools/sweet-log-pull.py`). If SMMU stalls: Adreno
+SMMU bypass/map at `0x05040000`. If RING IDLE: GPU clear into splash.
+Daily GUI remains 0091 / `sweetgpu=1`.
 
 ---
 
