@@ -19,8 +19,15 @@ User: "FAI STA ROBBA DI METAL". Started the real Adreno path:
 boot = same image rebuilt with `sweetgpu=4` after CI. If the panel dies, that
 is RPMH/PDC still missing — fall back to smooth.
 
-**Next:** CI 0090 → boot `sweetgpu=4`, pull log for `GMU CM3 UP` or TIMEOUT;
-then HFI queues + SQE (B2). Vendor FW via `gpu-fw.py` when phone is in Android.
+**CI + images (2026-10-30):**
+- Run **40971064426** SUCCESS → `xnu/out-0090/kernel.development.sweet`.
+- `shim/out/shim-boot-0090.img` = daily (`sweetgpu=1`, noconsole/cache/cpus=8).
+- `shim/out/shim-boot-0090-metal.img` = GMU test (`sweetgpu=4`). Look for
+  `SWEET GPU: GMU CM3 UP` in the log; TIMEOUT means RPMH/PDC next.
+- Also booted **0089** smooth at ~00:08 (`fastboot boot` OKAY) while 0090 built.
+
+**Next:** `fastboot boot shim/out/shim-boot-0090-metal.img`, pull log; then HFI
+queues + SQE (B2). Vendor FW via `gpu-fw.py` when phone is in Android.
 
 ---
 
