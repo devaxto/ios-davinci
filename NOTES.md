@@ -2,7 +2,43 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-29 late - DPU probe 0087 (read first) <<<
+### >>> UPDATE 2026-10-29 late night - DPU flip 0088 (read first) <<<
+
+User desperate for Metal/GPU "stra bene". Honest boundary unchanged: iOS ships
+AGX machine code, so real Metal on Adreno 618 is AGX→a6xx translation (research
+track, not this milestone). What makes an iPhone feel smooth without that is
+still the present path: the DPU scans memory; the CPU should never copy.
+
+**0088 implemented (sources in `tools/gpu-src/`, patch
+`xnu/patches/0088-davinci-dpu-flip.patch`, replay byte-identical):**
+- `SweetDisplay`: probe now *remembers* the live SSPP `SRC_ADDR` / `YSTRIDE`,
+  picks a CTL with nonzero `CTL_LAYER`, records video vs cmd from INTF/PP
+  liveness; new `sweet_display_flip(phys,stride)` / `can_flip` / `flip_reset`.
+- `SweetSurface`: create prefers `inTaskWithPhysicalMask` +
+  `kIOMemoryPhysicallyContiguous` below 4 GB; logs `phys 0x…`; 
+  `sweet_surface_phys()`.
+- `SweetFramebuffer`: `sweetfb_flip=1` → one full-screen contiguous layer
+  becomes cache-clean + SRC_ADDR + CTL_FLUSH (CPU copy remains the fallback).
+  Power-off fade calls `flip_reset` so it hits the ABL buffer again.
+- Default stays `sweetfb_flip=0` (a bad flip blanks the panel until reboot).
+
+**Next concrete action (needs the phone):**
+1. Still pull the 0087 log if that boot is up (`python tools/sweet-log-pull.py
+   logs/boot-0087.txt`) and confirm `SWEET DPU: … is the panel framebuffer`
+   + `flip ready` once 0088 is booted.
+2. CI-build 0088, package `shim-boot-0088.img` with
+   `sweetfb_hz=60 sweetfb_cache=1 sweetdpu=1 sweetfb_flip=1 sweetgpu=1`
+   (console on for the first flip boot), `fastboot boot` it.
+3. Success look: `SWEET FB: flip surface …` and present lines with
+   `flips N` rising and copy us near 0. Failure: black panel → reboot
+   without `sweetfb_flip`.
+
+**Still blocked for Track B (Adreno):** `tools/gpu-fw.py` needs Android/OrangeFox
+with /vendor. No adb/fastboot device attached this session.
+
+---
+
+### >>> UPDATE 2026-10-29 late - DPU probe 0087 (superseded by 0088 above) <<<
 
 User asked for a *definitive* GPU port. The honest boundary is unchanged:
 iOS ships AGX machine code and compiles AIR for AGX, so Metal/IOAccelerator
@@ -51,10 +87,8 @@ is why writing that buffer shows on the panel), so a present can become
    over adb, same read as `sweet-log-pull.sh` but runs on Windows:
    `python tools/sweet-log-pull.py logs/boot-0087.txt`.
 
-**NOT booted yet** - no adb/fastboot device was attached during this
-session. Confidence: patch replay byte-identical and the CI build includes
-and compiles `SweetDisplay.cpp` (kernel grew 1040 B vs 0086), so the code is
-sound; the register values it prints are unobserved.
+**Booted** `shim-boot-0087.img` 2026-10-29 ~23:36 (`fastboot boot` OKAY).
+Await GUI feel + later log pull for `SWEET DPU:` / `SWEET FB: present`.
 
 **Next concrete action (needs the phone):** boot the 0087 image
 (`fastboot boot shim/out/shim-boot-0087.img`) with `sweetdpu=1` (default)

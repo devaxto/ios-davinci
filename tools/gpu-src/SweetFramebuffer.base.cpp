@@ -37,7 +37,15 @@
  * default framebuffer surface. The kernel text console keeps drawing over
  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
  * the first swap on (it still reaches the persistent log; panics draw).
+ *
+ * The copy goes through a cached mapping by default (sweetfb_cache=0 asks
+ * for write-combined instead): a 10 MB frame of write-combined stores is a
+ * 10-20 ms stall, the same frame memcpy'd into cache + dc cvac is about 1 ms.
+ * start() also runs the read-only DPU probe (SweetDisplay.cpp): the bootloader
+ * has the display controller scanning this buffer out, and the registers it
+ * left behind are what a zero-copy present needs.
  */
+#include "SweetDisplay.h"
 #include "SweetSurface.h"
 
 extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -197,11 +205,12 @@ AppleCLCD::start(IOService *provider)
 	 * 1080x2340 frame then costs several milliseconds per present. A cached
 	 * mapping plus an explicit clean (dc cvac) is much faster because the
 	 * copy runs at memory bandwidth; the display controller is not cache
-	 * coherent, hence the flush in present(). sweetfb_cache=1 selects it.
+	 * coherent, hence the flush in present(). Cached is the default,
+	 * sweetfb_cache=0 selects the write-combined mapping again.
 	 */
-	fCacheMode = 0;
+	fCacheMode = 1;
 	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
-	if (fCacheMode == 1 && fSurface != NULL) {
+	if (fCacheMode != 0 && fSurface != NULL) {
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
 		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
 		fMap = md != NULL ? md->map(kIOMapCopybackCache) : NULL;
@@ -251,8 +260,11 @@ AppleCLCD::start(IOService *provider)
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
 	registerService();
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, "
-	    "presented as %ux%u, copy every %u us\n",
-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS);
+	    "presented as %ux%u, present every %u us, panel %s\n",
+	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS,
+	    fCacheMode != 0 ? "cached" : "write-combined");
+	/* Read-only: what the bootloader left the display controller doing. */
+	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
 	return true;
 }
 

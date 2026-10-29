@@ -1,23 +1,18 @@
 /*
- * DAVINCI: read-only probe of the display controller (MDSS/SDE) that the
- * bootloader left running.
+ * DAVINCI: probe + zero-copy flip of the display controller (MDSS/SDE) that
+ * the bootloader left running.
  *
  * The whole display path today is "CPU writes the ABL splash buffer at
  * 0x9c000000 and the DPU keeps scanning it out". The registers that do that
- * are configured by the bootloader and never touched by XNU, so the probe
- * reads them and logs them: that is how the live layer (SSPP), mixer, CTL
- * and INTF, plus the source address/stride/format, are recovered. Nothing is
- * written and no clock or GDSC is touched, so a wrong guess costs a log, not
- * a panel. A block whose clocks are gated reads as 0/0xffffffff and the dump
- * stops instead of hammering the bus.
+ * are configured by the bootloader; the probe reads them, remembers the live
+ * SSPP SRC_ADDR / YSTRIDE and the CTL flush bit, and (only when asked via
+ * sweet_display_flip) rewrites SRC_ADDR so a present is two MMIO writes
+ * instead of a 10 MB memcpy. See docs/GPU.md.
  *
- * Register offsets below are the davinci DTB values (qcom,sde-off,
- * qcom,sde-ctl-off, qcom,sde-mixer-off, qcom,sde-sspp-off, qcom,sde-intf-off,
- * qcom,sde-pp-off) relative to mdp_phys 0xae00000. They are not guesses.
- *
- * Next step (docs/GPU.md, "zero-copy present"): with the layer located, a
- * present becomes SRC_ADDR/STRIDE + a CTL flush, i.e. no 10 MB CPU copy at
- * all.
+ * Register offsets below are the davinci DTB values relative to mdp_phys
+ * 0xae00000. SSPP_SRC0_ADDR = +0x14, SSPP_SRC_YSTRIDE0 = +0x24, CTL_FLUSH =
+ * +0x018, CTL_START = +0x01C (Linux dpu_hw_sspp / dpu_hw_ctl). Flush bits
+ * match SDE: VIG0/1 = 0/1, DMA0/1/2 = 11/12/24, LM0 = 6.
  */
 #include "SweetDisplay.h"
 
@@ -28,49 +23,71 @@
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 
-#define MDSS_PA             0x0ae00000u    /* mdp_phys, DTB reg[0] */
-#define MDSS_SIZE           0x00084208u    /* covers CTL/LM/SSPP/INTF/PP */
-#define MDSS_SDE_OFF        0x01000u       /* qcom,sde-off */
-#define DSI0_PA             0x0ae94000u    /* qcom,mdss_dsi_ctrl0 */
+#define MDSS_PA             0x0ae00000u
+#define MDSS_SIZE           0x00084208u
+#define MDSS_SDE_OFF        0x01000u
+#define DSI0_PA             0x0ae94000u
 #define DSI0_SIZE           0x00001000u
+
+#define SSPP_SRC0_ADDR      0x014u
+#define SSPP_SRC_YSTRIDE0   0x024u
+#define CTL_FLUSH           0x018u
+#define CTL_START           0x01Cu
+#define CTL_LAYER           0x000u
 
 struct sweet_dpu_block {
 	const char *name;
 	uint32_t    off;
 	uint32_t    len;
-	bool        live;       /* timing engine: check that it is counting */
+	bool        live;
+	uint32_t    flush;      /* CTL_FLUSH bit for this SSPP, 0 if not an SSPP */
 };
 
-/*
- * SSDPP 0/1 are the vig pipes, 2/3/4 the dma pipes (qcom,sde-sspp-type).
- * INTF 0 is DisplayPort, 1 and 2 are the two DSI controllers.
- */
 static const struct sweet_dpu_block kDpuBlocks[] = {
-	{ "top",   0x01000u, 0x45cu, false },
-	{ "ctl0",  0x02000u, 0x1e0u, false },
-	{ "ctl1",  0x02200u, 0x1e0u, false },
-	{ "ctl2",  0x02400u, 0x1e0u, false },
-	{ "ctl3",  0x02600u, 0x1e0u, false },
-	{ "lm0",   0x45000u, 0x320u, true },
-	{ "lm1",   0x46000u, 0x320u, true },
-	{ "lm2",   0x47000u, 0x320u, true },
-	{ "lm3",   0x48000u, 0x320u, true },
-	{ "vig0",  0x05000u, 0x1f0u, false },
-	{ "vig1",  0x07000u, 0x1f0u, false },
-	{ "dma0",  0x25000u, 0x1f0u, false },
-	{ "dma1",  0x27000u, 0x1f0u, false },
-	{ "dma2",  0x29000u, 0x1f0u, false },
-	{ "intf0", 0x6b000u, 0x100u, true },
-	{ "intf1", 0x6b800u, 0x100u, true },
-	{ "intf2", 0x6c000u, 0x100u, true },
-	{ "intf3", 0x6c800u, 0x100u, true },
-	{ "pp0",   0x71000u, 0x0d4u, true },
-	{ "pp1",   0x71800u, 0x0d4u, true },
-	{ "pp2",   0x72000u, 0x0d4u, true },
-	{ "pp3",   0x72800u, 0x0d4u, true },
+	{ "top",   0x01000u, 0x45cu, false, 0 },
+	{ "ctl0",  0x02000u, 0x1e0u, false, 0 },
+	{ "ctl1",  0x02200u, 0x1e0u, false, 0 },
+	{ "ctl2",  0x02400u, 0x1e0u, false, 0 },
+	{ "ctl3",  0x02600u, 0x1e0u, false, 0 },
+	{ "lm0",   0x45000u, 0x320u, true,  0 },
+	{ "lm1",   0x46000u, 0x320u, true,  0 },
+	{ "lm2",   0x47000u, 0x320u, true,  0 },
+	{ "lm3",   0x48000u, 0x320u, true,  0 },
+	{ "vig0",  0x05000u, 0x1f0u, false, (1u << 0) },
+	{ "vig1",  0x07000u, 0x1f0u, false, (1u << 1) },
+	{ "dma0",  0x25000u, 0x1f0u, false, (1u << 11) },
+	{ "dma1",  0x27000u, 0x1f0u, false, (1u << 12) },
+	{ "dma2",  0x29000u, 0x1f0u, false, (1u << 24) },
+	{ "intf0", 0x6b000u, 0x100u, true,  0 },
+	{ "intf1", 0x6b800u, 0x100u, true,  0 },
+	{ "intf2", 0x6c000u, 0x100u, true,  0 },
+	{ "intf3", 0x6c800u, 0x100u, true,  0 },
+	{ "pp0",   0x71000u, 0x0d4u, true,  0 },
+	{ "pp1",   0x71800u, 0x0d4u, true,  0 },
+	{ "pp2",   0x72000u, 0x0d4u, true,  0 },
+	{ "pp3",   0x72800u, 0x0d4u, true,  0 },
 };
 
-#define SWEET_DPU_LIVE_WORDS    64      /* one INTF/PP block, for the liveness check */
+#define SWEET_DPU_LIVE_WORDS    64
+#define SWEET_DPU_LM0_FLUSH     (1u << 6)
+
+struct sweet_dpu_state {
+	vm_offset_t mdss;
+	uint32_t    sspp_off;
+	uint32_t    src_addr_off;   /* absolute from mdss base */
+	uint32_t    src_stride_off;
+	uint32_t    ctl_off;
+	uint32_t    flush_mask;
+	uint32_t    orig_pa;
+	uint32_t    orig_stride;
+	uint32_t    cur_pa;
+	uint32_t    cur_stride;
+	int         video_mode;     /* INTF/PP counters moved */
+	int         ready;
+	const char *sspp_name;
+};
+
+static struct sweet_dpu_state g_dpu;
 
 static uint32_t
 dpu_rd(vm_offset_t base, uint32_t off)
@@ -78,7 +95,13 @@ dpu_rd(vm_offset_t base, uint32_t off)
 	return *(volatile uint32_t *)(base + off);
 }
 
-/* Nonzero words only: a zeroed register is an unconfigured one. */
+static void
+dpu_wr(vm_offset_t base, uint32_t off, uint32_t v)
+{
+	*(volatile uint32_t *)(base + off) = v;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
 static void
 dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
     uint32_t fb_pa, uint32_t fb_stride, uint32_t *words, uint32_t *nonzero)
@@ -95,18 +118,34 @@ dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
 		if (v == fb_pa) {
 			IOLog("SWEET DPU: %s+0x%03x is the panel framebuffer\n",
 			    b->name, off);
-		} else if (v == fb_stride) {
+			/*
+			 * Prefer the canonical SRC0_ADDR offset; accept any hit
+			 * inside an SSPP so a quirky ABL programming still works.
+			 */
+			if (b->flush != 0 && (!g_dpu.ready || off == SSPP_SRC0_ADDR)) {
+				g_dpu.sspp_off = b->off;
+				g_dpu.src_addr_off = b->off + off;
+				g_dpu.src_stride_off = b->off + SSPP_SRC_YSTRIDE0;
+				g_dpu.flush_mask = b->flush | SWEET_DPU_LM0_FLUSH;
+				g_dpu.orig_pa = fb_pa;
+				g_dpu.cur_pa = fb_pa;
+				g_dpu.sspp_name = b->name;
+				g_dpu.ready = 1;
+			}
+		} else if (v == fb_stride || (v & 0xffffu) == fb_stride) {
 			IOLog("SWEET DPU: %s+0x%03x is the panel stride\n",
 			    b->name, off);
+			if (b->flush != 0) {
+				g_dpu.orig_stride = fb_stride;
+				g_dpu.cur_stride = fb_stride;
+				if (g_dpu.sspp_off == b->off) {
+					g_dpu.src_stride_off = b->off + off;
+				}
+			}
 		}
 	}
 }
 
-/*
- * Which INTF/PP is actually scanning: a live timing engine moves its frame and
- * line counters. Two reads 30 ms apart settle it, which is also how a mixer
- * that only holds a stale config is told apart from the one in use.
- */
 static void
 dpu_check_live(vm_offset_t base, const struct sweet_dpu_block *b)
 {
@@ -135,6 +174,27 @@ dpu_check_live(vm_offset_t base, const struct sweet_dpu_block *b)
 	}
 	IOLog("SWEET DPU: %s %u/%u words moved in 30 ms%s\n", b->name, moved, n,
 	    moved ? " (live)" : "");
+	if (moved != 0 && (b->name[0] == 'i' || b->name[0] == 'p')) {
+		/* intf* / pp* counters advancing => video mode. */
+		g_dpu.video_mode = 1;
+	}
+}
+
+static void
+dpu_pick_ctl(vm_offset_t base)
+{
+	static const uint32_t ctls[] = { 0x02000u, 0x02200u, 0x02400u, 0x02600u };
+
+	for (unsigned int i = 0; i < sizeof(ctls) / sizeof(ctls[0]); i++) {
+		if (dpu_rd(base, ctls[i] + CTL_LAYER) != 0) {
+			g_dpu.ctl_off = ctls[i];
+			IOLog("SWEET DPU: using ctl at +0x%x (layer=0x%08x)\n",
+			    ctls[i], dpu_rd(base, ctls[i] + CTL_LAYER));
+			return;
+		}
+	}
+	g_dpu.ctl_off = ctls[0];
+	IOLog("SWEET DPU: no live CTL_LAYER, defaulting to ctl0\n");
 }
 
 void
@@ -150,11 +210,16 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 		return;
 	}
 
+	bzero(&g_dpu, sizeof(g_dpu));
+	g_dpu.orig_stride = fb_stride;
+	g_dpu.cur_stride = fb_stride;
+
 	mdss = ml_io_map(MDSS_PA, MDSS_SIZE);
 	if (mdss == 0) {
 		IOLog("SWEET DPU: MDSS map failed\n");
 		return;
 	}
+	g_dpu.mdss = mdss;
 
 	IOLog("SWEET DPU: panel 0x%llx %ux%u stride %u\n",
 	    (unsigned long long)fb_phys, fb_width, fb_height, fb_stride);
@@ -178,21 +243,77 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 		}
 	}
 
+	dpu_pick_ctl(mdss);
+
 	dsi = ml_io_map(DSI0_PA, DSI0_SIZE);
 	if (dsi == 0) {
 		IOLog("SWEET DPU: DSI0 map failed\n");
+	} else {
+		for (uint32_t off = 0; off < 0x100; off += 4) {
+			uint32_t v = dpu_rd(dsi, off);
+
+			if (v == 0) {
+				continue;
+			}
+			found++;
+			IOLog("SWEET DPU: dsi0+0x%03x=0x%08x\n", off, v);
+		}
+		IOLog("SWEET DPU: dsi0 0x%08x, %u nonzero words\n", DSI0_PA, found);
+	}
+
+	if (g_dpu.ready) {
+		IOLog("SWEET DPU: flip ready on %s SRC_ADDR=+0x%x YSTRIDE=+0x%x "
+		    "CTL=+0x%x flush=0x%x %s\n",
+		    g_dpu.sspp_name ? g_dpu.sspp_name : "?",
+		    g_dpu.src_addr_off, g_dpu.src_stride_off, g_dpu.ctl_off,
+		    g_dpu.flush_mask,
+		    g_dpu.video_mode ? "video" : "cmd-or-idle");
+	} else {
+		IOLog("SWEET DPU: no SSPP holds the panel PA - flip disabled\n");
+	}
+}
+
+bool
+sweet_display_can_flip(void)
+{
+	return g_dpu.ready && g_dpu.mdss != 0 && g_dpu.ctl_off != 0;
+}
+
+bool
+sweet_display_flip(uint32_t phys, uint32_t stride)
+{
+	uint32_t ystride;
+
+	if (!sweet_display_can_flip() || phys == 0) {
+		return false;
+	}
+	if (phys == g_dpu.cur_pa && stride == g_dpu.cur_stride) {
+		return true;
+	}
+
+	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, phys);
+	if (stride != 0 && stride != g_dpu.cur_stride) {
+		ystride = dpu_rd(g_dpu.mdss, g_dpu.src_stride_off);
+		ystride = (ystride & 0xffff0000u) | (stride & 0xffffu);
+		dpu_wr(g_dpu.mdss, g_dpu.src_stride_off, ystride);
+		g_dpu.cur_stride = stride;
+	}
+	dpu_wr(g_dpu.mdss, g_dpu.ctl_off + CTL_FLUSH, g_dpu.flush_mask);
+	if (!g_dpu.video_mode) {
+		/* Command-mode panels need an explicit kick. */
+		dpu_wr(g_dpu.mdss, g_dpu.ctl_off + CTL_START, 1u);
+	}
+	g_dpu.cur_pa = phys;
+	return true;
+}
+
+void
+sweet_display_flip_reset(void)
+{
+	if (!sweet_display_can_flip() || g_dpu.orig_pa == 0) {
 		return;
 	}
-	for (uint32_t off = 0; off < 0x100; off += 4) {
-		uint32_t v = dpu_rd(dsi, off);
-
-		if (v == 0) {
-			continue;
-		}
-		found++;
-		IOLog("SWEET DPU: dsi0+0x%03x=0x%08x\n", off, v);
-	}
-	IOLog("SWEET DPU: dsi0 0x%08x, %u nonzero words\n", DSI0_PA, found);
+	(void)sweet_display_flip(g_dpu.orig_pa, g_dpu.orig_stride);
 }
 
 #else /* !SWEET */
@@ -205,6 +326,25 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 	(void)fb_stride;
 	(void)fb_width;
 	(void)fb_height;
+}
+
+bool
+sweet_display_can_flip(void)
+{
+	return false;
+}
+
+bool
+sweet_display_flip(uint32_t phys, uint32_t stride)
+{
+	(void)phys;
+	(void)stride;
+	return false;
+}
+
+void
+sweet_display_flip_reset(void)
+{
 }
 
 #endif /* SWEET */

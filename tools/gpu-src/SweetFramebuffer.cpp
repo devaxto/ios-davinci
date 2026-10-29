@@ -41,9 +41,9 @@
  * The copy goes through a cached mapping by default (sweetfb_cache=0 asks
  * for write-combined instead): a 10 MB frame of write-combined stores is a
  * 10-20 ms stall, the same frame memcpy'd into cache + dc cvac is about 1 ms.
- * start() also runs the read-only DPU probe (SweetDisplay.cpp): the bootloader
- * has the display controller scanning this buffer out, and the registers it
- * left behind are what a zero-copy present needs.
+ * start() also runs the DPU probe (SweetDisplay.cpp). With sweetfb_flip=1 and
+ * a contiguous layer surface below 4 GB, present becomes SRC_ADDR + CTL flush
+ * instead of the memcpy (CPU fallback stays for anything the probe missed).
  */
 #include "SweetDisplay.h"
 #include "SweetSurface.h"
@@ -134,6 +134,8 @@ public:
 	uint64_t      fCopyUs;        /* duration of the last panel copy */
 	uint64_t      fFrameBytes;    /* bytes the last present copied */
 	uint32_t      fCacheMode;     /* 1 = cached panel mapping + dc cvac */
+	uint32_t      fFlipMode;      /* 1 = DPU SRC_ADDR flip when possible */
+	uint64_t      fFlips;         /* zero-copy presents */
 	bool          fPowerOff;      /* RequestPowerChange(0) */
 	uint32_t      fFadeStep;      /* fade-out steps done while off */
 
@@ -210,6 +212,8 @@ AppleCLCD::start(IOService *provider)
 	 */
 	fCacheMode = 1;
 	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
+	fFlipMode = 0;
+	PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
 	if (fCacheMode != 0 && fSurface != NULL) {
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
 		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
@@ -260,11 +264,15 @@ AppleCLCD::start(IOService *provider)
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
 	registerService();
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, "
-	    "presented as %ux%u, present every %u us, panel %s\n",
+	    "presented as %ux%u, present every %u us, panel %s, flip %s\n",
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS,
-	    fCacheMode != 0 ? "cached" : "write-combined");
-	/* Read-only: what the bootloader left the display controller doing. */
+	    fCacheMode != 0 ? "cached" : "write-combined",
+	    fFlipMode != 0 ? "on" : "off");
+	/* Discover the live SSPP; enables sweet_display_flip when found. */
 	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
+	if (fFlipMode != 0 && !sweet_display_can_flip()) {
+		IOLog("SWEET FB: sweetfb_flip=1 but DPU layer not found, CPU copy stays\n");
+	}
 	return true;
 }
 
@@ -353,6 +361,10 @@ AppleCLCD::presentFired(OSObject *owner, IOTimerEventSource *sender)
 	IOLockUnlock(fb->fLock);
 
 	if (off) {
+		/* Fade must hit the buffer the DPU is scanning. */
+		if (step == 0 && fb->fFlipMode != 0) {
+			sweet_display_flip_reset();
+		}
 		/* Fade out: halve every channel each step, then black, then idle. */
 		if (step <= 6) {
 			for (uint32_t y = 0; y < fb->fHeight; y++) {
@@ -383,10 +395,12 @@ AppleCLCD::presentFired(OSObject *owner, IOTimerEventSource *sender)
 	if ((fb->fPresents % 120) == 0 && fb->fPresents != 0) {
 		uint64_t mbps = fb->fCopyUs != 0 ?
 		    (fb->fFrameBytes * 1000000ULL) / (fb->fCopyUs * (1024ULL * 1024ULL)) : 0;
-		IOLog("SWEET FB: present %llu %u us %llu KB %llu MB/s every %u us\n",
+		IOLog("SWEET FB: present %llu %u us %llu KB %llu MB/s every %u us "
+		    "(flips %llu)\n",
 		    (unsigned long long)fb->fPresents, (uint32_t)fb->fCopyUs,
 		    (unsigned long long)(fb->fFrameBytes / 1024),
-		    (unsigned long long)mbps, period);
+		    (unsigned long long)mbps, period,
+		    (unsigned long long)fb->fFlips);
 	}
 	sender->setTimeoutUS(period);
 }
@@ -440,12 +454,95 @@ AppleCLCD::swap(const uint8_t *rec)
 	}
 }
 
+/*
+ * Zero-copy present: one full-screen BGRA layer whose backing store is a
+ * single contiguous PA below 4 GB -> point the live SSPP at it. Anything else
+ * (multi-layer, partial rect, non-contiguous) falls through to the CPU copy.
+ */
+static bool
+sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
+{
+	uint32_t mask = get32(rec, 0x104);
+	uint32_t found = 0, id = 0;
+	int32_t sx, sy, dx, dy, w, h;
+	const uint8_t *a, *b;
+	SweetSurface *s;
+	uint64_t phys;
+	uintptr_t src;
+	static uint32_t flip_logged;
+
+	if (fb->fFlipMode == 0 || !sweet_display_can_flip()) {
+		return false;
+	}
+	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+		if (!(mask & (1u << layer))) {
+			continue;
+		}
+		id = get32(rec, 0x54 + 4 * layer);
+		if (id == 0) {
+			continue;
+		}
+		found++;
+		if (found > 1) {
+			return false;
+		}
+		a = rec + 0x64 + 16 * layer;
+		b = rec + 0xc4 + 16 * layer;
+		sx = (int32_t)get32(a, 0);
+		sy = (int32_t)get32(a, 4);
+		dx = (int32_t)get32(b, 0) - fb->fOffX;
+		dy = (int32_t)get32(b, 4) - fb->fOffY;
+		w = (int32_t)get32(b, 8);
+		h = (int32_t)get32(b, 12);
+	}
+	if (found != 1) {
+		return false;
+	}
+	s = sweet_surface_copy(id);
+	if (s == NULL || s == fb->fSurface) {
+		OSSafeReleaseNULL(s);
+		return false;
+	}
+	if (w <= 0 || h <= 0) {
+		w = (int32_t)s->width;
+		h = (int32_t)s->height;
+	}
+	if (sx < 0 || sy < 0 || dx != 0 || dy != 0 ||
+	    w != (int32_t)fb->fWidth || h != (int32_t)fb->fHeight ||
+	    sx != 0 || sy != 0 ||
+	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+		s->release();
+		return false;
+	}
+	phys = sweet_surface_phys(s);
+	src = s->kernelAddress();
+	if (phys == 0 || phys > 0xffffffffull || src == 0) {
+		s->release();
+		return false;
+	}
+	/* DPU is not cache coherent: clean what CA just drew. */
+	sweet_fb_clean_rows(src + s->offset, (size_t)s->bytesPerRow,
+	    (int32_t)s->height, s->bytesPerRow);
+	if (!sweet_display_flip((uint32_t)phys, s->bytesPerRow)) {
+		s->release();
+		return false;
+	}
+	fb->fFlips++;
+	fb->fFrameBytes = 0;
+	if (flip_logged < 8) {
+		flip_logged++;
+		IOLog("SWEET FB: flip surface %u pa 0x%llx stride %u\n",
+		    s->id, (unsigned long long)phys, s->bytesPerRow);
+	}
+	s->release();
+	return true;
+}
+
 /* Copy each enabled layer's surface into the panel memory (no scaling). */
 void
 AppleCLCD::present(const uint8_t *rec)
 {
 	uint32_t mask = get32(rec, 0x104);
-
 
 	if (!fConsolePaused) {
 		int quiet = 0;
@@ -455,6 +552,10 @@ AppleCLCD::present(const uint8_t *rec)
 			 * writes the read-only-late cons_ops_index and panics. */
 			sweet_console_muted = 1;
 		}
+	}
+
+	if (sweet_fb_try_flip(this, rec)) {
+		return;
 	}
 
 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {

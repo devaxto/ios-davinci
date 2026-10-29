@@ -104,24 +104,23 @@ Nothing is written, no clock or GDSC is touched; if the SDE reads back
 0/0xffffffff the dump stops instead of hammering a gated block. Read the
 log for `SWEET DPU:` lines after a boot.
 
-### The flip (next patch)
+### 0088 — the flip (sweetfb_flip=1, opt-in)
 
-One present becomes: clean the surface (`dc cvac` over the written rect,
-the DPU is not cache coherent) + write `SRC_ADDR` (stride/size/format only
-if they differ) + flush the pipe so the swap lands in the next vblank.
-Preconditions the probe has to confirm, so they are checked in code:
+One present becomes: clean the surface (dc cvac over the written rect,
+the DPU is not cache coherent) + rewrite SRC_ADDR (and the low 16 bits of
+YSTRIDE0 when the stride differs) + CTL_FLUSH (and CTL_START if the
+probe saw no live INTF/PP counters). Implemented in
+SweetDisplay.cpp + AppleCLCD::present(); IOSurface create prefers
+kIOMemoryPhysicallyContiguous below 4 GB so layers have a PA the DPU can
+read. Preconditions checked at runtime:
 
-- the surface is physically contiguous and below 4 GB: the DPU's SMMU is
-  bypassed (the ABL left it that way for the splash buffer), so IOSurface
-  backing stores for layers that get flipped must be allocated with
-  `kIOMemoryPhysicallyContiguous` and a 32-bit physical mask;
-- the stride/format are what the layer already accepts (CA produces
-  1080x2400 BGRA, 4352 B/row);
-- a vblank reference: without it a flip tears, so the INTF/PP counter from
-  the probe is the clock to sync the flip to;
-- the CPU copy stays as the fallback for anything the probe did not
-  identify or that is not contiguous - a wrong flip is a dead panel until
-  reboot, so it is opt-in (`sweetfb_flip=1`) until it has booted cleanly.
+- the probe found an SSPP holding the panel PA (SWEET DPU: flip ready on …);
+- exactly one enabled full-screen BGRA layer, dest rect = panel, src at 0,0;
+- that surface's sweet_surface_phys() is nonzero and <= 4 GB;
+- anything else (multi-layer, partial rect, non-contiguous) keeps the CPU
+  copy. A wrong flip can blank the panel until reboot, so the default is
+  off (sweetfb_flip=0); boot with sweetfb_flip=1 after 0087's probe log
+  has confirmed the live layer.
 
 ### After the flip: hardware layers
 
