@@ -56,6 +56,16 @@ public:
  */
 uint64_t sweet_surface_phys(SweetSurface *s);
 
+/*
+ * Carve the ABL splash region (disp_rdump_region, typically 24 MB at
+ * 0x9c000000) into slots the DPU can already scan. Full-screen IOSurfaces
+ * are allocated from those slots so CoreAnimation draws into memory the
+ * display controller can flip to - no expensive contiguous DRAM alloc.
+ * Slot 0 is the live panel (owned by AppleCLCD); CA gets 1..N-1.
+ */
+void sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
+    uint32_t slot_bytes);
+
 /* Retained surface for an id, or NULL. */
 SweetSurface *sweet_surface_copy(uint32_t id);
 

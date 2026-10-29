@@ -212,8 +212,17 @@ AppleCLCD::start(IOService *provider)
 	 */
 	fCacheMode = 1;
 	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
-	fFlipMode = 0;
-	PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
+	/*
+	 * Splash pool: CA full-screen layers land in the ABL 24 MB carve-out the
+	 * DPU already scans. Flip defaults ON so present is SRC_ADDR, not memcpy.
+	 * sweetfb_flip=0 forces the CPU copy path again.
+	 */
+	{
+		/* Two ~12 MB slots in the 24 MB splash: fits 1125x2436 BGRA. */
+		sweet_surface_set_splash_pool(fPhys, 24u << 20, (24u << 20) / 2);
+		fFlipMode = 1;
+		PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
+	}
 	if (fCacheMode != 0 && fSurface != NULL) {
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
 		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
@@ -514,6 +523,11 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		s->release();
 		return false;
 	}
+	/* Surface must cover the panel; stride may differ (CA pads to 64 B). */
+	if (s->width < fb->fWidth || s->height < fb->fHeight) {
+		s->release();
+		return false;
+	}
 	phys = sweet_surface_phys(s);
 	src = s->kernelAddress();
 	if (phys == 0 || phys > 0xffffffffull || src == 0) {
@@ -522,7 +536,7 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	}
 	/* DPU is not cache coherent: clean what CA just drew. */
 	sweet_fb_clean_rows(src + s->offset, (size_t)s->bytesPerRow,
-	    (int32_t)s->height, s->bytesPerRow);
+	    (int32_t)fb->fHeight, s->bytesPerRow);
 	if (!sweet_display_flip((uint32_t)phys, s->bytesPerRow)) {
 		s->release();
 		return false;

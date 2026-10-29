@@ -2,6 +2,26 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - splash flip 0091: make it feel like an iPhone (read first) <<<
+
+User: still laggy, wants iPhone smoothness. Honest: CA is still CPU software
+(\CA::OGL::SW\); Metal/GMU (0090) does not paint SpringBoard. The present
+memcpy was the part we can kill today.
+
+**0091:** full-screen IOSurfaces allocate from the ABL 24 MB splash carve-out
+(2x ~12 MB slots the DPU already scans). \sweetfb_flip\ defaults **on**:
+present = cache-clean + SRC_ADDR, not 10 MB memcpy. \sweetfb_flip=0\ /
+\sweetfb_splash=0\ restore the old path. No contig-everywhere (0088 lesson).
+
+**Still not iPhone-GPU:** until AGX→a6xx (METAL-PORT B5) the CPU still
+*draws* every frame; we only stopped *copying* it to the panel.
+
+**Next:** CI 0091 → \shim-boot-0091.img\ (oconsole cache cpus=8 sweetgpu=1\,
+flip on by default) → \astboot boot\. Success log: \splash slot\ +
+\SWEET FB: flip surface\. Black screen → boot 0090 daily (\sweetfb_flip=0\).
+
+---
+
 ### >>> UPDATE 2026-10-30 - Metal track B1: GMU fw load 0090 (read first) <<<
 
 User: "FAI STA ROBBA DI METAL". Started the real Adreno path:
