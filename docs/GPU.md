@@ -219,6 +219,7 @@ Status 2026-10-29 night: Track A present path is 0086+0087+0089 (0088 always-on 
 | `1` | Read-only probe (default). Never enables rails |
 | `2` | Power CX GDSC + GCC/GPUCC clocks, read `RBBM_CHIP_ID` |
 | `3` | Also register IOKit `AGXAccelerator` stub (may break SW GUI) |
+| `4` | Load embedded a630 GMU fw into ITCM and start CM3 (B1) |
 
 ### Phase 0 — probe (patch 0084)
 

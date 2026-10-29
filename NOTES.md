@@ -2,6 +2,28 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - Metal track B1: GMU fw load 0090 (read first) <<<
+
+User: "FAI STA ROBBA DI METAL". Started the real Adreno path:
+
+1. Pulled `a630_gmu.bin` + `a630_sqe.fw` from linux-firmware (LFS mirror) into
+   local `fw/` (gitignored). Same family as Adreno 618 / a618 legacy GMU.
+2. **0090** (`0090-davinci-gmu-fw-load.patch`): embeds GMU fw, maps full GMU
+   aperture `0x31000`, `sweetgpu=4` dumps ITCM + CM3 start + polls
+   `FW_INIT_RESULT` (linux a6xx legacy path). Does **not** enable the
+   AGXAccelerator stub (still `sweetgpu=3` only) so the SW GUI stays safe.
+3. Host tool `tools/agx-metallib.py` to inventory iOS `.metallib` containers
+   (B5 start: inspect only, no AGX→a6xx yet).
+
+**Daily boot stays** `shim-boot-smooth.img` / 0089 (`sweetgpu=1`). GMU test
+boot = same image rebuilt with `sweetgpu=4` after CI. If the panel dies, that
+is RPMH/PDC still missing — fall back to smooth.
+
+**Next:** CI 0090 → boot `sweetgpu=4`, pull log for `GMU CM3 UP` or TIMEOUT;
+then HFI queues + SQE (B2). Vendor FW via `gpu-fw.py` when phone is in Android.
+
+---
+
 ### >>> UPDATE 2026-10-29 ~23:58 - 0088 lag regression + smooth recovery (read first) <<<
 
 **Observation (user):** 0088 boot was *more* laggy, kernel logs visible on the
