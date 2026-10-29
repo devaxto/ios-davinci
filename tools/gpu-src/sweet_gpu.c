@@ -6,8 +6,8 @@
  *   1 = read-only probe (default) - never enables rails
  *   2 = enable CX GDSC + GCC/GPUCC clocks, read RBBM_CHIP_ID
  *   3 = also allow IOKit AGXAccelerator stub (SweetAccelerator.cpp)
- *   4 = load embedded a630 GMU firmware into ITCM and start the CM3
- *       (a618 = legacy HFI path). Still NOT Metal: proves the GMU runs.
+ *   4 = load embedded a618 GMU firmware into ITCM and start the CM3
+ *       (Xiaomi vendor a618_gmu.bin; legacy HFI). Still NOT Metal.
  *   5 = after GMU: HFI qtbl + OOB GX/GPU_SET + SQE + CP ring + ME_INIT/NOP
  *       (Metal track B2 start). Does NOT enable the AGX stub.
  *
@@ -464,8 +464,8 @@ gpu_gmu_clear_oob(uint32_t clear_bit)
 }
 
 /*
- * a618 = legacy GMU (linux a6xx_gmu.c): dump a630_gmu.bin into ITCM, drop
- * CM3 reset, wait for FW_INIT_RESULT. For sweetgpu>=5 also plant an HFI
+ * a618 = legacy GMU (linux a6xx_gmu.c): dump vendor a618_gmu.bin into ITCM,
+ * drop CM3 reset, wait for FW_INIT_RESULT. For sweetgpu>=5 also plant an HFI
  * queue table before releasing reset so OOB/GX can talk.
  */
 static bool

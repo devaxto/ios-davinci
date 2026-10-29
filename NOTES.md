@@ -2,6 +2,18 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - 0093 vendor GMU/SQE embedded (read first) <<<
+
+Re-embed Xiaomi vendor blobs into the kernel (B0 → bring-up):
+`a618_gmu.bin` (≠ LFS a630) + vendor `a630_sqe.fw` (32136 B). Patch
+`0093-davinci-vendor-gmu-sqe.patch`. Still `sweetgpu=5` for SQE/ring test;
+daily stays 0091 / `sweetgpu=1`.
+
+**Next:** CI → `shim-boot-0093-metal.img` → `fastboot boot` → log for
+`GMU CM3 UP` / `SQE RING IDLE` with the real vendor microcode.
+
+---
+
 ### >>> UPDATE 2026-10-30 - B0 vendor fw PULLED (OrangeFox) <<<
 
 OrangeFox `aa20029b` recovery. GPT `vendor` (sda23) is empty; real vendor
