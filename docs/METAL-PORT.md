@@ -19,7 +19,7 @@ why `sweetgpu=3` stays off on daily images.
 | A | Smooth CPU present (cache copy → DPU flip) | nothing | **now** (0086–0089) |
 | B0 | Pull GMU / SQE / ZAP from vendor (`tools/gpu-fw.py`) | Android or OrangeFox + /vendor | days |
 | B1 | CX/GMU power, load FW, read chip id stably | B0 | weeks |
-| B2 | Ringbuffer + IB + clear/blit into IOSurface | B1 | months |
+| B2 | Ringbuffer + IB + clear/blit into IOSurface | B1 | **now** (0092 = SQE/ME_INIT; blit next) |
 | B3 | IOAccelerator / IOGPU user-client ABI (trace-driven) | B2 | months |
 | B4 | Tiny custom Metal path (our shaders only) | B3 | months |
 | B5 | AGX ISA decode → a6xx emit (research) | B4 + RE | **years** |
@@ -38,12 +38,11 @@ panel), not by registering a fake `AGXAccelerator`.
 4. Firmware blobs stay in `fw/` (gitignored). Only `fw/manifest.txt`
    hashes may be committed.
 
-## Immediate next (B0)
+## Immediate next (B2)
 
-With the phone in Android or OrangeFox (`/vendor` mounted):
+`sweetgpu=5` (patch 0092) loads SQE, programs the CP ring, submits
+`CP_ME_INIT` + `CP_NOP`. Boot the metal image and look for
+`SWEET GPU: SQE RING IDLE` (or `SMMU_STALL` / `TIMEOUT` which names the
+next fix). After RPTR advances: clear/blit into splash (prove pixels).
 
-```text
-python tools/gpu-fw.py
-```
-
-That unblocks B1. Without it, every "Metal" change is theater.
+Daily GUI stays on 0091 / `sweetgpu=1`. Do not enable `sweetgpu=3`.

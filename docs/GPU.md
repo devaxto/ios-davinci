@@ -220,6 +220,7 @@ Status 2026-10-29 night: Track A present path is 0086+0087+0089 (0088 always-on 
 | `2` | Power CX GDSC + GCC/GPUCC clocks, read `RBBM_CHIP_ID` |
 | `3` | Also register IOKit `AGXAccelerator` stub (may break SW GUI) |
 | `4` | Load embedded a630 GMU fw into ITCM and start CM3 (B1) |
+| `5` | After GMU: HFI qtbl + OOB GX/GPU_SET + SQE + CP ring ME_INIT/NOP (B2) |
 
 ### Phase 0 — probe (patch 0084)
 

@@ -2,6 +2,31 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - GPU VERA 0092: SQE + CP ring (read first) <<<
+
+User: "DOBBIAMO FARE UNA CAZZO DI GPU VERA". Track B2 started — not the AGX
+stub, real Adreno packets.
+
+**0092** (`0092-davinci-sqe-ring.patch`): embeds `a630_sqe.fw` next to GMU;
+`sweetgpu=5` after GMU CM3 UP does HFI qtbl in low-bank scratch
+(`0x9d800000`, past ABL splash), OOB BOOT_SLUMBER + SPTPRAC + OOB GPU_SET,
+copies SQE (skip 4-byte header like linux), programs `CP_SQE_INSTR_BASE` /
+`CP_RB_*`, `SQE_CNTL=1`, submits `CP_ME_INIT` + `CP_NOP`. Success log:
+`SWEET GPU: SQE RING IDLE` / `Metal track B2 milestone`. Failure names
+SMMU stall or RPTR timeout. Still **not** Metal for SpringBoard (CA stays
+`CA::OGL::SW`); blit into splash is the next pixel proof. Daily boot stays
+0091 / `sweetgpu=1` — never `sweetgpu=3`.
+
+**Sources:** `tools/gpu-src/sweet_gpu.c` (+ `.0090.c` snap), `embed_fw.py`
+(GMU+SQE), `gen_0092_patch.py`. Docs: `GPU.md` mode 5, `METAL-PORT.md` B2.
+
+**Next:** commit + CI on `pro/gpu-bringup` → `shim-boot-0092-metal.img`
+(`sweetgpu=5`); `fastboot boot`; pull log for RING IDLE / SMMU_STALL.
+If SMMU stalls: Adreno SMMU bypass/map at `0x05040000`. Then GPU clear
+into splash PA.
+
+---
+
 ### >>> UPDATE 2026-10-30 - splash flip 0091: make it feel like an iPhone (read first) <<<
 
 User: still laggy, wants iPhone smoothness. Honest: CA is still CPU software
