@@ -38,6 +38,7 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSUnserialize.h>
+#include <pexpert/pexpert.h>
 #include <sys/proc.h>
 
 enum {
@@ -222,6 +223,31 @@ sweet_surface_publish(SweetSurface *s)
 	ok = sweet_surface_insert_locked(s);
 	IOLockUnlock(sweet_surface_lock);
 	return ok;
+}
+
+/*
+ * Contiguous alloc is expensive. Only pay for it when the user asked for DPU
+ * flips and the surface is a full-screen-ish BGRA layer the SSPP could scan.
+ */
+static bool
+sweet_surface_want_contig(SweetSurface *s)
+{
+	static int flip = -1;
+
+	if (flip < 0) {
+		flip = 0;
+		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
+	}
+	if (flip <= 0 || s == NULL) {
+		return false;
+	}
+	if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+		return false;
+	}
+	if (s->width < 720 || s->height < 1280 || s->allocSize < (2u << 20)) {
+		return false;
+	}
+	return true;
 }
 
 /*
@@ -721,15 +747,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
 			/*
-			 * Prefer a physically contiguous buffer below 4 GB so the
-			 * DPU can scan it out (sweet_display_flip). Fall back to a
-			 * normal wired buffer if the contiguous alloc fails - the
-			 * CPU present path still works.
+			 * Contiguous below 4 GB only when sweetfb_flip is on AND this
+			 * looks like a display layer. Contig-alloc on every IOSurface
+			 * (icons, glyphs, …) stalls the allocator and was the 0088 lag.
 			 */
-			mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-			    kIODirectionInOut | kIOMemoryKernelUserShared |
-			    kIOMemoryPhysicallyContiguous,
-			    s->allocSize, 0x00000000ffffffffull);
+			if (sweet_surface_want_contig(s)) {
+				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+				    kIODirectionInOut | kIOMemoryKernelUserShared |
+				    kIOMemoryPhysicallyContiguous,
+				    s->allocSize, 0x00000000ffffffffull);
+			}
 			if (mem == NULL) {
 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 				    kIODirectionInOut | kIOMemoryKernelUserShared,
@@ -743,13 +770,15 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 			bzero(mem->getBytesNoCopy(), s->allocSize);
 			s->memory = mem;
 			s->mapCache = kIOMapDefaultCache;
-			sweet_surface_capture_phys(s);
+			if (sweet_surface_want_contig(s)) {
+				sweet_surface_capture_phys(s);
+			}
 			if (!sweet_surface_publish(s)) {
 				ret = kIOReturnNoResources;
 			}
 		}
 	}
-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 16) {
 		char name[32];
 		proc_selfname(name, sizeof(name));
 		sweet_surface_creates_logged++;

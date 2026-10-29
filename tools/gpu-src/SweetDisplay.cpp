@@ -102,6 +102,9 @@ dpu_wr(vm_offset_t base, uint32_t off, uint32_t v)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
+/* sweetdpu=1: discover quietly. sweetdpu=2: dump every nonzero register. */
+static int g_dpu_verbose;
+
 static void
 dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
     uint32_t fb_pa, uint32_t fb_stride, uint32_t *words, uint32_t *nonzero)
@@ -114,7 +117,9 @@ dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
 			continue;
 		}
 		(*nonzero)++;
-		IOLog("SWEET DPU: %s+0x%03x=0x%08x\n", b->name, off, v);
+		if (g_dpu_verbose >= 2) {
+			IOLog("SWEET DPU: %s+0x%03x=0x%08x\n", b->name, off, v);
+		}
 		if (v == fb_pa) {
 			IOLog("SWEET DPU: %s+0x%03x is the panel framebuffer\n",
 			    b->name, off);
@@ -166,14 +171,16 @@ dpu_check_live(vm_offset_t base, const struct sweet_dpu_block *b)
 			continue;
 		}
 		moved++;
-		if (shown < 4) {
+		if (g_dpu_verbose >= 2 && shown < 4) {
 			shown++;
 			IOLog("SWEET DPU: %s+0x%03x moved 0x%08x -> 0x%08x\n",
 			    b->name, 4 * i, before[i], after[i]);
 		}
 	}
-	IOLog("SWEET DPU: %s %u/%u words moved in 30 ms%s\n", b->name, moved, n,
-	    moved ? " (live)" : "");
+	if (g_dpu_verbose >= 2 || moved != 0) {
+		IOLog("SWEET DPU: %s %u/%u words moved in 30 ms%s\n", b->name, moved, n,
+		    moved ? " (live)" : "");
+	}
 	if (moved != 0 && (b->name[0] == 'i' || b->name[0] == 'p')) {
 		/* intf* / pp* counters advancing => video mode. */
 		g_dpu.video_mode = 1;
@@ -209,6 +216,7 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 	if (mode <= 0) {
 		return;
 	}
+	g_dpu_verbose = mode;
 
 	bzero(&g_dpu, sizeof(g_dpu));
 	g_dpu.orig_stride = fb_stride;
@@ -249,16 +257,18 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 	if (dsi == 0) {
 		IOLog("SWEET DPU: DSI0 map failed\n");
 	} else {
-		for (uint32_t off = 0; off < 0x100; off += 4) {
-			uint32_t v = dpu_rd(dsi, off);
+	for (uint32_t off = 0; off < 0x100; off += 4) {
+		uint32_t v = dpu_rd(dsi, off);
 
-			if (v == 0) {
-				continue;
-			}
-			found++;
+		if (v == 0) {
+			continue;
+		}
+		found++;
+		if (g_dpu_verbose >= 2) {
 			IOLog("SWEET DPU: dsi0+0x%03x=0x%08x\n", off, v);
 		}
-		IOLog("SWEET DPU: dsi0 0x%08x, %u nonzero words\n", DSI0_PA, found);
+	}
+	IOLog("SWEET DPU: dsi0 0x%08x, %u nonzero words\n", DSI0_PA, found);
 	}
 
 	if (g_dpu.ready) {

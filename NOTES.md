@@ -2,7 +2,32 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-29 late night - DPU flip 0088 (read first) <<<
+### >>> UPDATE 2026-10-29 ~23:58 - 0088 lag regression + smooth recovery (read first) <<<
+
+**Observation (user):** 0088 boot was *more* laggy, kernel logs visible on the
+panel while the GUI ran. Agent mistake: (1) `sweetfb_flip=1` on a first boot,
+(2) **contiguous alloc on every IOSurface** (icons/glyphs/etc.) — that stalls
+the allocator even when flip never fires, (3) no `sweetfb_noconsole` so
+`IOLog` kept painting over the UI.
+
+**Fix 0089** (`0089-sweet-fb-smooth.patch`): contig only when `sweetfb_flip=1`
+AND the surface is a large BGRA layer; DPU register spam only at `sweetdpu=2`.
+Metal decade track written down in `docs/METAL-PORT.md` (B0=pull vendor FW;
+B5/B6 = AGX→a6xx, years). Do **not** enable `sweetgpu=3` on daily images.
+
+**Recovered now:** built + **booted** `shim/out/shim-boot-smooth.img`
+(= `D:\Sborrosuigay\shim-boot-smooth.img`, sha256
+`88deee66c10e8f8b43a16db54f5240d887100cf3b546a954656451006d1900b9`) =
+0087 kernel + `cpus=8 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_cache=1
+sweetdpu=1 sweetgpu=1`, **no flip**. `fastboot boot` OKAY ~23:58. This is the
+daily image until 0089 CI lands.
+
+**Next:** CI 0089 → `shim-boot-0089.img` same cmdline as smooth; user confirms
+feel vs 0088; Metal B0 = `python tools/gpu-fw.py` when phone is in Android.
+
+---
+
+### >>> UPDATE 2026-10-29 late night - DPU flip 0088 (superseded — caused lag) <<<
 
 User desperate for Metal/GPU "stra bene". Honest boundary unchanged: iOS ships
 AGX machine code, so real Metal on Adreno 618 is AGX→a6xx translation (research
