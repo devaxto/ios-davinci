@@ -2,6 +2,23 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - B0 vendor fw PULLED (OrangeFox) <<<
+
+OrangeFox `aa20029b` recovery. GPT `vendor` (sda23) is empty; real vendor
+is erofs **dm-1**. Mounted `/dev/block/dm-1` → `/mnt/vendor_erofs`, pulled:
+
+| file | size | note |
+| --- | --- | --- |
+| `a618_gmu.bin` | 32768 | **differs** from LFS `a630_gmu.bin` |
+| `a630_sqe.fw` | 32136 | vendor (0092 embedded LFS was 34188) |
+| `a615_zap.{mdt,elf,b00-b02}` | TZ ZAP for a618 | not `a630_zap.mbn` |
+
+`fw/manifest.txt` lists vendor vs linux-firmware-lfs. `gpu-fw.py` now also
+probes `/mnt/vendor_erofs/firmware`. **Next:** re-embed `a618_gmu.bin` +
+vendor SQE into kernel (0093) — 0092 still carries LFS a630 GMU.
+
+---
+
 ### >>> UPDATE 2026-10-30 - GPU VERA 0092: SQE + CP ring (read first) <<<
 
 User: "DOBBIAMO FARE UNA CAZZO DI GPU VERA". Track B2 started — not the AGX

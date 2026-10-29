@@ -17,7 +17,7 @@ why `sweetgpu=3` stays off on daily images.
 | Phase | What | Depends on | Est. |
 | --- | --- | --- | --- |
 | A | Smooth CPU present (cache copy → DPU flip) | nothing | **now** (0086–0089) |
-| B0 | Pull GMU / SQE / ZAP from vendor (`tools/gpu-fw.py`) | Android or OrangeFox + /vendor | days |
+| B0 | Pull GMU / SQE / ZAP from vendor (`tools/gpu-fw.py`) | OrangeFox dm-1 | **done** 2026-10-30 |
 | B1 | CX/GMU power, load FW, read chip id stably | B0 | weeks |
 | B2 | Ringbuffer + IB + clear/blit into IOSurface | B1 | **now** (0092 = SQE/ME_INIT; blit next) |
 | B3 | IOAccelerator / IOGPU user-client ABI (trace-driven) | B2 | months |

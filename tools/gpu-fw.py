@@ -32,10 +32,16 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "fw"
 
 # Vendor firmware lives in one of these, depending on the Android build.
+# OrangeFox on davinci: dynamic vendor is erofs on dm-1; the GPT "vendor"
+# slot (sda23) is empty. Mount dm-1 yourself or use the recovery Mount
+# menu; we also probe common remount points used in recovery shells.
 FW_DIRS = (
     "/vendor/firmware_mnt/image",
     "/vendor/firmware",
+    "/mnt/vendor_erofs/firmware",
+    "/mnt/vendor/firmware",
     "/firmware/image",
+    "/tmp/modem/image",
     "/system/vendor/firmware",
 )
 
