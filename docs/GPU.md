@@ -209,12 +209,7 @@ by backboardd.
 
 ## Phases
 
-Status 2026-10-29 (late): 0084/0085/0086 are compiled and booted (CI
-`40963755393`, boot image `shim-boot-0086*.img`); 0087 is the current tip
-and is being compiled. The GPU side stops at "CX powered, chip id read"
-until the firmware can be pulled off the phone's vendor partition
-(`tools/gpu-fw.py` needs the phone in Android). Track A2 (DPU) needs only
-a boot with the probe in it, so it goes first.
+Status 2026-10-29 night: Track A present path is 0086+0087+0089 (0088 always-on contiguous alloc made the GUI worse; contig is gated behind sweetfb_flip=1 again). Daily boot = shim-boot-smooth.img (0087 kernel, sweetfb_noconsole=1 sweetfb_cache=1 cpus=8, no flip). GPU side still stops at CX powered / chip id until tools/gpu-fw.py can read vendor (Android or OrangeFox). Real Metal is the multi-year track in docs/METAL-PORT.md.
 
 ### Boot-arg `sweetgpu`
 
