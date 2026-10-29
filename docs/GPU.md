@@ -23,10 +23,13 @@ Two independent walls. Only one of them can be moved with kernel code:
    the long-term research track, not the next milestone.
 2. **The present path is the CPU.** Everything CoreAnimation draws is
    copied into the panel by the CPU: `AppleCLCD::present()` does a
-   ~10 MB `memcpy` per frame into a write-combined mapping of the ABL
-   framebuffer (patch 0046), throttled to `sweetfb_hz` ticks. This is
-   where frames are lost today, and it needs no firmware, no TZ and no
-   shader translation.
+   ~10 MB `memcpy` per frame into the ABL framebuffer (patch 0046), throttled
+   to `sweetfb_hz` ticks. This is where frames are lost today, and it needs
+   no firmware, no TZ and no shader translation. It is also the one wall that
+   is *entirely* ours: the panel framebuffer is scanned out by the DPU that
+   the bootloader left running, so the copy is only needed because the
+   composited IOSurface is a different buffer. See "zero-copy present"
+   below; patch 0087 starts it.
 
 So the work splits:
 
@@ -55,22 +58,98 @@ raising the rate moved the copy onto the CA pacing path.
   capped at 50 ms, so a slow mapping costs update rate, not CPU.
 - every 120 presents: `SWEET FB: present N <us> <KB> <MB/s> every <us>` -
   the copy cost is now measured, not guessed.
-- `sweetfb_cache=1` maps the panel through `kIOMapCopybackCache` and
-  flushes the written lines with `dc cvac` + `dsb sy` (the display
-  controller is not cache coherent). Default stays write-combined; the
-  log above decides which one wins on real hardware.
+- the panel is mapped **cached** (`kIOMapCopybackCache`) by default from
+  0087 on and the written lines are cleaned with `dc cvac` + `dsb sy`
+  (the display controller is not cache coherent); `sweetfb_cache=0` gets
+  the old write-combined mapping back. Write-combined stores cap a
+  10 MB frame at 10-20 ms; the same copy into cache is ~1 ms.
 - one big `memcpy` when the layer row and the panel stride match, and the
   copied byte count is reported instead of being implied.
 - `SwapWait` logs its first 8 calls (caller name, scalar inputs, presented
   count) so CA pacing can be understood from the kernel log alone.
 
 Read the result like this: copy <= 5 ms means `sweetfb_hz=60` is honest;
-copy of 10-20 ms means write-combined stores are the limit and
-`sweetfb_cache=1` is the fix; a copy that never shrinks means the layer
-rect (the `w`,`h` in the swap record) is full-screen every time and dirty
-rects have to come from CA, not from us.
+copy of 10-20 ms means the panel mapping is still write-combined
+(`sweetfb_cache=0` forces that, check the boot line says `panel cached`);
+a copy that never shrinks means the layer rect (the `w`,`h` in the swap
+record) is full-screen every time and dirty rects have to come from CA, not
+from us.
+
+## Track A2 — zero-copy present (patch 0087 and the flip)
+
+Measured facts that make this the real target:
+
+- `0x9c000000` is the device tree's `disp_rdump_region` (24 MB). The ABL
+  programmed the DPU (`mdss@ae00000`, SDE top at `+0x1000`, CTLs at
+  `0x2000`, mixers at `0x45000`, SSPPs at `0x5000`/`0x25000`, INTFs at
+  `0x6b000`) to scan it out over DSI0 (`dsi_ctrl0@ae94000`, PLL
+  `0xae94a00`) and keeps doing it while XNU runs - that is why writing
+  pixels there puts them on the panel.
+- So a present is not "move 10 MB"; it is "make the DPU read the surface
+  CoreAnimation just finished". Today the two are different buffers.
+
+### 0087 — the probe (`sweetdpu=1`, read-only, default on)
+
+`iokit/Kernel/arm/SweetDisplay.cpp` maps the MDP window and logs every
+nonzero word of `top`, `ctl0-3`, `lm0-3`, `vig0-1`, `dma0-2`, `intf0-3`,
+`pp0-3` and the first 0x100 of DSI0, plus:
+
+- `... +0xNNN is the panel framebuffer` / `is the panel stride` for any word
+  equal to the panel PA (0x9c000000) or stride (4320): that names
+  `SRC_ADDR`/`SRC_STRIDE` of the live layer without guessing.
+- `... moved 0x... -> 0x...` and `... N/64 words moved in 30 ms (live)`:
+  the frame/line counters of the INTF and PP that are actually scanning.
+
+Nothing is written, no clock or GDSC is touched; if the SDE reads back
+0/0xffffffff the dump stops instead of hammering a gated block. Read the
+log for `SWEET DPU:` lines after a boot.
+
+### The flip (next patch)
+
+One present becomes: clean the surface (`dc cvac` over the written rect,
+the DPU is not cache coherent) + write `SRC_ADDR` (stride/size/format only
+if they differ) + flush the pipe so the swap lands in the next vblank.
+Preconditions the probe has to confirm, so they are checked in code:
+
+- the surface is physically contiguous and below 4 GB: the DPU's SMMU is
+  bypassed (the ABL left it that way for the splash buffer), so IOSurface
+  backing stores for layers that get flipped must be allocated with
+  `kIOMemoryPhysicallyContiguous` and a 32-bit physical mask;
+- the stride/format are what the layer already accepts (CA produces
+  1080x2400 BGRA, 4352 B/row);
+- a vblank reference: without it a flip tears, so the INTF/PP counter from
+  the probe is the clock to sync the flip to;
+- the CPU copy stays as the fallback for anything the probe did not
+  identify or that is not contiguous - a wrong flip is a dead panel until
+  reboot, so it is opt-in (`sweetfb_flip=1`) until it has booted cleanly.
+
+### After the flip: hardware layers
+
+The DPU scans several SSPPs into one mixer with per-stage blending. Once a
+flip works, the layers CA lists in `SwapEnd` can be bound to spare SSPPs and
+blended by the display controller: the CPU then draws each layer and the
+kernel stops copying at all. Track B (Adreno) is the same goal with
+shaders and stays independent of it.
 
 ## Hardware map (SM7150 / Linux sm7150.dtsi)
+
+Display path (from `dtb/davinci.dtb`, all offsets relative to the MDP
+window `0xae00000`, size `0x84208`):
+
+| Block | Offset | Notes |
+| --- | --- | --- |
+| SDE top | `0x01000` | `qcom,sde-off`, len `0x45c` |
+| CTL 0-5 | `0x02000` + n*`0x200` | `qcom,sde-ctl-off`, len `0x1e0` |
+| LM 0-3 | `0x45000` + n*`0x1000` | `qcom,sde-mixer-off`, len `0x320` |
+| SSPP vig 0-1 | `0x05000`, `0x07000` | `qcom,sde-sspp-off`, len `0x1f0` |
+| SSPP dma 0-2 | `0x25000`, `0x27000`, `0x29000` | ditto |
+| INTF 0-3 | `0x6b000` + n*`0x800` | 0 = DP, 1/2 = DSI, len `0x100` |
+| PP 0-3 | `0x71000` + n*`0x800` | ping-pong, len `0xd4` |
+| DSI ctrl0 | `0xae94000` | PHY `0xae94400`, PLL `0xae94a00` |
+| DispCC | `0xaf00000` | `qcom,dispcc` |
+| Panel buffer | `0x9c000000` | `disp_rdump_region`, 24 MB, ABL splash |
+
+GPU path:
 
 | Block | PA | Size | Notes |
 | --- | --- | --- | --- |
@@ -131,10 +210,12 @@ by backboardd.
 
 ## Phases
 
-Status 2026-10-29: 0084, 0085 and 0086 are written but **have never been
-compiled** - the GitHub Actions account is locked for billing, so every
-run fails before the job starts (see `NOTES.md`). Nothing below has run on
-the phone yet; treat the log formats as intent, not as observed output.
+Status 2026-10-29 (late): 0084/0085/0086 are compiled and booted (CI
+`40963755393`, boot image `shim-boot-0086*.img`); 0087 is the current tip
+and is being compiled. The GPU side stops at "CX powered, chip id read"
+until the firmware can be pulled off the phone's vendor partition
+(`tools/gpu-fw.py` needs the phone in Android). Track A2 (DPU) needs only
+a boot with the probe in it, so it goes first.
 
 ### Boot-arg `sweetgpu`
 

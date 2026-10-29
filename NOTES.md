@@ -2,6 +2,121 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-29 late - DPU probe 0087 (read first) <<<
+
+User asked for a *definitive* GPU port. The honest boundary is unchanged:
+iOS ships AGX machine code and compiles AIR for AGX, so Metal/IOAccelerator
+on Adreno 618 means AGX->a6xx translation - not a port. What *is* achievable
+and is what an iPhone actually does for its smoothness is the present path:
+the display controller scans memory to the panel, the CPU should never copy.
+
+**The key fact found today (read-only, from `dtb/davinci.dtb`):**
+`0x9c000000` is `/reserved-memory/disp_rdump_region` (24 MB) and the ABL
+programmed the DPU (`mdss@ae00000`, SDE top `+0x1000`, CTL `0x2000`+,
+LM `0x45000`+, SSPP `0x5000`/`0x25000`+, INTF `0x6b000`+, PP `0x71000`+,
+DSI0 `0xae94000`) to scan it out. It is still scanning while XNU runs (that
+is why writing that buffer shows on the panel), so a present can become
+"point the live layer at CoreAnimation's surface" = 2 MMIO writes + one
+`dc cvac`, instead of a 10 MB memcpy.
+
+**Done this session:**
+1. New `xnu/patches/0087-davinci-dpu-probe.patch` (`xnu/patches`, generated
+   by `tools/gpu-src/gen_0087_patch.py`; sources of truth are
+   `tools/gpu-src/SweetDisplay.{h,cpp}` and `SweetFramebuffer.{base,}.cpp`):
+   - `iokit/Kernel/arm/SweetDisplay.cpp`, read-only probe, boot-arg
+     `sweetdpu` (1 = on, default). Dumps every nonzero word of SDE top,
+     CTL0-3, LM0-3, VIG0-1, DMA0-2, INTF0-3, PP0-3 and DSI0's first 0x100,
+     marks any word equal to the panel PA (0x9c000000) or stride (4320)
+     (`... is the panel framebuffer`), and does a 30 ms two-read liveness
+     check on INTF/LM/PP. Nothing is written; a dead SDE (rev 0/0xffffffff)
+     stops the dump.
+   - `SweetFramebuffer.cpp`: the panel copy is **cached by default** now
+     (`kIOMapCopybackCache` + `dc cvac`); `sweetfb_cache=0` restores the
+     write-combined mapping. This is the 10-20 ms -> ~1 ms per frame fix
+     for the "0086 at 60 Hz is slower" regression the user reported.
+   - start() logs `... present every N us, panel cached|write-combined` and
+     then runs the DPU probe.
+2. Patch replay verified (`tools/reconstruct-file.py`, byte-identical).
+3. CI on `pro` (devaxto/ios-davinci), ref `gpu-bringup`, commit `008fd51`,
+   run **40965977429** SUCCESS in 4m51s -> `xnu/out-0087/kernel.development.sweet`
+   (17 234 656 B, SHA256 in that dir).
+4. **Boot image built** `shim/out/shim-boot-0087.img` (also
+   `D:\Sborrosuigay\shim-boot-0087.img`, 17 219 584 B, sha256
+   `6e9493d938459ef8040078e6392794010eeca75c34a994aa8bc0b3c9b2106b29`) =
+   make-boot.py --image-only + `shim/out/payload-0087.bin` (0087 kernel +
+   `shim/out/extracted.adt`) + `dtb/davinci.dtb`. Cmdline (verified in the
+   payload at 0x48): the working davinci line with `sweetfb_hz=60
+   sweetfb_cache=1 sweetdpu=1 sweetgpu=1` added, console left ON.
+5. `tools/sweet-log-pull.py` (new): the 0047 log ring read from recovery
+   over adb, same read as `sweet-log-pull.sh` but runs on Windows:
+   `python tools/sweet-log-pull.py logs/boot-0087.txt`.
+
+**NOT booted yet** - no adb/fastboot device was attached during this
+session. Confidence: patch replay byte-identical and the CI build includes
+and compiles `SweetDisplay.cpp` (kernel grew 1040 B vs 0086), so the code is
+sound; the register values it prints are unobserved.
+
+**Next concrete action (needs the phone):** boot the 0087 image
+(`fastboot boot shim/out/shim-boot-0087.img`) with `sweetdpu=1` (default)
+and pull the log; the `SWEET DPU:` block answers, in one shot:
+- which SSPP feeds the panel and at which register offset the PA/stride sit
+  (that is SRC_ADDR/SRC_STRIDE for 0088's flip);
+- whether the path is video mode (INTF/PP counters move) or a one-shot
+  command-mode panel (nothing moves -> flip is impossible, DSI write path);
+- which INTF/DSI is the primary, for vblank sync.
+Then 0088 = flip behind `sweetfb_flip=1` with the CPU copy as fallback:
+requires physically contiguous <4 GB layer buffers
+(`kIOMemoryPhysicallyContiguous` + 32-bit mask in SweetSurface), a cache
+clean of the written rect, and a vblank-synced flush.
+
+**Still blocked:** Adreno/Track B needs `tools/gpu-fw.py` to read the
+vendor partition (GMU firmware, SQE, ZAP), i.e. the phone booted into
+Android (or OrangeFox with /vendor mounted). No adb/fastboot device was
+attached during this session (`adb devices`, `fastboot devices` empty).
+
+---
+
+### >>> UPDATE 2026-10-29 night (CI on GitHub Pro - read first) <<<
+
+**CI moved to Pro account `devaxto`.** Repo private:
+https://github.com/devaxto/ios-davinci (remotes: `pro` = this, `origin` =
+old `axtodev`). Logged in as `devaxto` (scopes repo+workflow). Dispatched
+`xnu` on `main` (= gpu-bringup tip `024149a`, includes 0084/0085/0086):
+run **40963755393** SUCCESS in 4m8s
+(https://github.com/devaxto/ios-davinci/actions/runs/40963755393).
+Downloaded `xnu/out-0086/kernel.development.sweet` (17 234 616 B).
+Built `shim/out/shim-boot-0086.img` (cmdline: `sweetfb_noconsole=1
+sweetfb_hz=60 sweetgpu=1` + usual). **Booted** 2026-10-29 ~23:16 (`sweetfb_hz=60`, no cache). User: slower
+than before — expected: WC panel stores at 60 Hz thrash CPU (docs GPU.md:
+10–20 ms copy → need `sweetfb_cache=1`). Built `shim-boot-0086c.img` then **max-perf**
+`shim/out/shim-boot-0086max.img` (`cpus=8 sweetfb_hz=60 sweetfb_cache=1
+sweetfb_noconsole=1 sweetgpu=1`). **Booted** `shim-boot-0086max.img` 2026-10-29 ~23:28 (`fastboot boot`
+OKAY). Await user feel vs prior boots.
+
+---
+
+### >>> UPDATE 2026-10-29 evening (userdata flash - read first) <<<
+
+**DONE (2026-10-29 ~22:30 local):**
+1. Flashed iOS 16.5 root to userdata from
+   `E:\Nuova cartella (4)\ios16-root.simg` via
+   `tools/flash_simg_segments.py --window-mib 32` (512 windows, ~13 min).
+   Direct Windows `fastboot flash -S 512M` cannot parse 27814 chunks.
+2. Earlier booted `D:\Sborrosuigay\shim-boot.img` (old copy; ADT still
+   `xiaomi,sweet`, cmdline had `davinci_touch_probeonly=0`).
+3. **Built the repo davinci boot image:**
+   `shim/out/shim-boot-davinci.img` (also `D:\Sborrosuigay\shim-boot-davinci.img`)
+   = make-boot.py + payload from CI kernel `xnu/out-davinci` (Antcating
+   run 39960804537) + ADT extracted from the prior working payload (has
+   /product) + `dtb/davinci.dtb` from that boot's DTB. Cmdline **without**
+   `sweetfb_noconsole` so kernel text stays on panel.
+4. **Booted** `shim/out/shim-boot-davinci.img` 2026-10-29 ~22:41
+   (`fastboot boot` OKAY Sending+Booting). Await screen report.
+
+**Do not** `fastboot getvar`. Keep Android bootloaders/recovery/modem/persist.
+
+---
+
 ### >>> UPDATE 2026-10-29 (GPU acceleration - read first) <<<
 
 **Two tracks, see docs/GPU.md.** The big finding: iOS ships *precompiled AGX
