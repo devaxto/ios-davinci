@@ -22,19 +22,29 @@ still the present path: the DPU scans memory; the CPU should never copy.
   Power-off fade calls `flip_reset` so it hits the ABL buffer again.
 - Default stays `sweetfb_flip=0` (a bad flip blanks the panel until reboot).
 
-**Next concrete action (needs the phone):**
-1. Still pull the 0087 log if that boot is up (`python tools/sweet-log-pull.py
-   logs/boot-0087.txt`) and confirm `SWEET DPU: … is the panel framebuffer`
-   + `flip ready` once 0088 is booted.
-2. CI-build 0088, package `shim-boot-0088.img` with
-   `sweetfb_hz=60 sweetfb_cache=1 sweetdpu=1 sweetfb_flip=1 sweetgpu=1`
-   (console on for the first flip boot), `fastboot boot` it.
-3. Success look: `SWEET FB: flip surface …` and present lines with
-   `flips N` rising and copy us near 0. Failure: black panel → reboot
-   without `sweetfb_flip`.
+**CI + boot (this session):**
+- Commit `be266b0` on `gpu-bringup`, CI run **40968460178** SUCCESS
+  (~4 min) → `xnu/out-0088/kernel.development.sweet` (17 234 896 B).
+- Image `shim/out/shim-boot-0088.img` (= `D:\Sborrosuigay\shim-boot-0088.img`,
+  17 219 584 B, sha256
+  `5c38cb4988e7ddaa5def8b44e3d5a8df297c748fe3c38bdbe4e589bb1a73338e`):
+  cmdline has `cpus=8 sweetfb_hz=60 sweetfb_cache=1 sweetdpu=1 sweetfb_flip=1
+  sweetgpu=1` (no `sweetfb_noconsole` so kernel text still reaches the panel
+  until the first successful flip).
+- **Booted** 2026-10-29 ~23:55 (`fastboot boot` OKAY 0.54 s). Await GUI feel
+  + later log pull for `SWEET DPU: flip ready` / `SWEET FB: flip surface`.
+
+**Next concrete action:**
+1. User reports whether the GUI feels smoother (or goes black).
+2. If black: `fastboot boot shim/out/shim-boot-0087.img` (flip off) to recover
+   display; pull log after recovery boot of 0088-without-flip if needed.
+3. If good: `python tools/sweet-log-pull.py logs/boot-0088.txt` from OrangeFox
+   and confirm `flips N` rising with present us near 0.
+4. Follow-up: default `sweetfb_flip=1` only after a clean confirmed boot;
+   multi-layer SSPP bind; Track B still needs `tools/gpu-fw.py` on Android.
 
 **Still blocked for Track B (Adreno):** `tools/gpu-fw.py` needs Android/OrangeFox
-with /vendor. No adb/fastboot device attached this session.
+with /vendor.
 
 ---
 
