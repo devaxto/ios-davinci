@@ -16,9 +16,11 @@ present = cache-clean + SRC_ADDR, not 10 MB memcpy. \sweetfb_flip=0\ /
 **Still not iPhone-GPU:** until AGX→a6xx (METAL-PORT B5) the CPU still
 *draws* every frame; we only stopped *copying* it to the panel.
 
-**Next:** CI 0091 → \shim-boot-0091.img\ (oconsole cache cpus=8 sweetgpu=1\,
-flip on by default) → \astboot boot\. Success log: \splash slot\ +
-\SWEET FB: flip surface\. Black screen → boot 0090 daily (\sweetfb_flip=0\).
+**CI + boot:** run **40972500520** SUCCESS -> xnu/out-0091.
+Image `shim/out/shim-boot-0091.img` (sha256
+`f35bd3dda48a86cdce2f5b17c7e972fec37976033e1a74ac807dd582d8d586de`).
+**Booted** 2026-10-30 ~00:25 (`fastboot boot` OKAY). Await feel +
+`splash slot` / `flip surface` in log. Black -> `shim-boot-0090.img`.
 
 ---
 
