@@ -12,8 +12,13 @@ User wants better performance. GPU still cannot paint SB. Path that can:
 3. **Feel experiment image**: same kernel + `sweetfb_native=1` so CA draws
    at panel size and safe flip can hit (may regress status-bar layout).
 
-Daily default stays logical iPhone X + crop-copy. Boot
-`shim-boot-0096.img`; try `shim-boot-0096-native.img` if still laggy.
+**CI + boot:** commit `eddd612`. Run **40980389065** SUCCESS → `xnu/out-0096`.
+- `shim-boot-0096.img` sha256 `ef304a8aaeef03d1d1b0bf27a3dcb5c0d687025d69a1a6b5d…` (crop-copy, iPhone X logical)
+- `shim-boot-0096-native.img` sha256 `3640561cbbe34642f70b7d7d100b100a0bc72f99e5aec4d8…` (`sweetfb_native=1` so flip can hit)
+
+**Booted native** 2026-10-30 ~01:40 (`fastboot boot` OKAY) — max feel experiment.
+If status bar / layout breaks: `fastboot boot shim/out/shim-boot-0096.img`.
+Fallback: `shim-boot-0091.img`.
 
 ---
 
