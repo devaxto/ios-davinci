@@ -2,6 +2,21 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - 0095 REGRESSION; recover 0091 (read first) <<<
+
+User: 0095 “va sempre più di merda”. **Revert path:** boot
+`shim/out/shim-boot-0091.img` (pre-crop). Watcher
+`tools/_boot_recover_0091.ps1` waiting on fastboot. Fallback
+`shim-boot-0095-safe.img` = 0095 kernel + `sweetfb_flip=0`.
+
+**Guess:** crop flip pointed SRC_ADDR/stride wrong (logical 1125 vs panel
+1080) and scrambled the scanout. Do **not** boot 0095 until fixed.
+Next fix candidate: keep 1125 logical for UIKit, but only flip when
+surface stride matches ABL stride; else memcpy — or gate crop behind
+`sweetfb_flip=2`.
+
+---
+
 ### >>> UPDATE 2026-10-30 - 0095 flip logical crop = real smoothness (read first) <<<
 
 User still laggy; asked for GPU “fatto bene”. Honest: SpringBoard is still
