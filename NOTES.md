@@ -17,7 +17,11 @@ points at the centered crop (`phys + offY*stride + offX*4`), stride = surface
 bpr. Look for `SWEET FB: flip surface … crop` and rising `flips` in the
 present log. Metal/GPU lab stays off daily (`sweetgpu=1`).
 
-**Next:** CI → `shim-boot-0095.img` (`sweetgpu=1`) → `fastboot boot` → feel.
+**CI + boot:** commit `1bd7f15`. Run **40978699555** SUCCESS → `xnu/out-0095`.
+Image `shim/out/shim-boot-0095.img` (sha256
+`d40f640e83b993893abb9bc9d6e38660abf385f67e95002af04ce20628cda2ca`),
+`sweetgpu=1`. **Booted** 2026-10-30 ~01:25 (`fastboot boot` OKAY). Await
+feel + `flip … crop` / `flips N` in log.
 
 ---
 
