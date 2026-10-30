@@ -2,6 +2,25 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - 0095 flip logical crop = real smoothness (read first) <<<
+
+User still laggy; asked for GPU “fatto bene”. Honest: SpringBoard is still
+CPU (`CA::OGL::SW`); Adreno packets do not paint it yet. The lag we *can*
+kill is the present path.
+
+**Root cause:** CA draws **1125x2436**; panel is **1080x2400** centered.
+Old `sweet_fb_try_flip` required dest == panel size → almost never flipped
+→ **~10 MB memcpy every frame**. That is the stutter.
+
+**0095:** flip accepts a full logical layer (or exact panel dest), SRC_ADDR
+points at the centered crop (`phys + offY*stride + offX*4`), stride = surface
+bpr. Look for `SWEET FB: flip surface … crop` and rising `flips` in the
+present log. Metal/GPU lab stays off daily (`sweetgpu=1`).
+
+**Next:** CI → `shim-boot-0095.img` (`sweetgpu=1`) → `fastboot boot` → feel.
+
+---
+
 ### >>> UPDATE 2026-10-30 - STOP metal-on-GUI; native drivers first (read first) <<<
 
 User: "da male in peggio" / wants native drivers perfect. **Observation:**

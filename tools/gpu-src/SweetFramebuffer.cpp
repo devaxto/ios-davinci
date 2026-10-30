@@ -464,20 +464,26 @@ AppleCLCD::swap(const uint8_t *rec)
 }
 
 /*
- * Zero-copy present: one full-screen BGRA layer whose backing store is a
- * single contiguous PA below 4 GB -> point the live SSPP at it. Anything else
- * (multi-layer, partial rect, non-contiguous) falls through to the CPU copy.
+ * Zero-copy present: one BGRA layer with a contiguous PA below 4 GB -> point
+ * the live SSPP at the panel-sized crop inside it.
+ *
+ * CA draws at the logical iPhone X size (1125x2436). The panel is the centered
+ * 1080x2400 (or 2340) window (fOffX/fOffY). The old flip path required the
+ * layer dest to already be panel-sized, so almost every present fell through
+ * to a ~10 MB CPU memcpy - that is the lag users feel. We accept a full
+ * logical layer (or an exact panel dest) and SRC_ADDR the crop.
  */
 static bool
 sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 {
 	uint32_t mask = get32(rec, 0x104);
 	uint32_t found = 0, id = 0;
-	int32_t sx, sy, dx, dy, w, h;
+	int32_t sx, sy, ldx, ldy, lw, lh;
+	uint32_t crop_x, crop_y;
 	const uint8_t *a, *b;
 	SweetSurface *s;
-	uint64_t phys;
-	uintptr_t src;
+	uint64_t phys, scan;
+	uintptr_t src, clean;
 	static uint32_t flip_logged;
 
 	if (fb->fFlipMode == 0 || !sweet_display_can_flip()) {
@@ -499,10 +505,10 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		b = rec + 0xc4 + 16 * layer;
 		sx = (int32_t)get32(a, 0);
 		sy = (int32_t)get32(a, 4);
-		dx = (int32_t)get32(b, 0) - fb->fOffX;
-		dy = (int32_t)get32(b, 4) - fb->fOffY;
-		w = (int32_t)get32(b, 8);
-		h = (int32_t)get32(b, 12);
+		ldx = (int32_t)get32(b, 0);
+		ldy = (int32_t)get32(b, 4);
+		lw = (int32_t)get32(b, 8);
+		lh = (int32_t)get32(b, 12);
 	}
 	if (found != 1) {
 		return false;
@@ -512,19 +518,36 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		OSSafeReleaseNULL(s);
 		return false;
 	}
-	if (w <= 0 || h <= 0) {
-		w = (int32_t)s->width;
-		h = (int32_t)s->height;
+	if (lw <= 0 || lh <= 0) {
+		lw = (int32_t)s->width;
+		lh = (int32_t)s->height;
 	}
-	if (sx < 0 || sy < 0 || dx != 0 || dy != 0 ||
-	    w != (int32_t)fb->fWidth || h != (int32_t)fb->fHeight ||
-	    sx != 0 || sy != 0 ||
+	if (sx < 0 || sy < 0 ||
 	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
 		s->release();
 		return false;
 	}
-	/* Surface must cover the panel; stride may differ (CA pads to 64 B). */
-	if (s->width < fb->fWidth || s->height < fb->fHeight) {
+
+	/*
+	 * Map the layer onto the panel crop inside the surface:
+	 *  - full logical dest (CA root): crop at (fOffX, fOffY)
+	 *  - dest already the panel hole: crop at source (sx, sy)
+	 */
+	if (ldx == 0 && ldy == 0 &&
+	    lw == (int32_t)fb->fLogicalW && lh == (int32_t)fb->fLogicalH &&
+	    sx == 0 && sy == 0) {
+		crop_x = (uint32_t)fb->fOffX;
+		crop_y = (uint32_t)fb->fOffY;
+	} else if (ldx == fb->fOffX && ldy == fb->fOffY &&
+	    lw == (int32_t)fb->fWidth && lh == (int32_t)fb->fHeight) {
+		crop_x = (uint32_t)sx;
+		crop_y = (uint32_t)sy;
+	} else {
+		s->release();
+		return false;
+	}
+
+	if (s->width < crop_x + fb->fWidth || s->height < crop_y + fb->fHeight) {
 		s->release();
 		return false;
 	}
@@ -534,10 +557,17 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		s->release();
 		return false;
 	}
-	/* DPU is not cache coherent: clean what CA just drew. */
-	sweet_fb_clean_rows(src + s->offset, (size_t)s->bytesPerRow,
+	scan = phys + (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u;
+	if (scan > 0xffffffffull) {
+		s->release();
+		return false;
+	}
+	/* DPU is not cache coherent: clean the panel window CA just drew. */
+	clean = src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
+	    (uint64_t)crop_x * 4u;
+	sweet_fb_clean_rows(clean, (size_t)fb->fWidth * 4u,
 	    (int32_t)fb->fHeight, s->bytesPerRow);
-	if (!sweet_display_flip((uint32_t)phys, s->bytesPerRow)) {
+	if (!sweet_display_flip((uint32_t)scan, s->bytesPerRow)) {
 		s->release();
 		return false;
 	}
@@ -545,8 +575,10 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	fb->fFrameBytes = 0;
 	if (flip_logged < 8) {
 		flip_logged++;
-		IOLog("SWEET FB: flip surface %u pa 0x%llx stride %u\n",
-		    s->id, (unsigned long long)phys, s->bytesPerRow);
+		IOLog("SWEET FB: flip surface %u pa 0x%llx crop %u,%u stride %u "
+		    "(logical %ux%u panel %ux%u)\n",
+		    s->id, (unsigned long long)scan, crop_x, crop_y, s->bytesPerRow,
+		    fb->fLogicalW, fb->fLogicalH, fb->fWidth, fb->fHeight);
 	}
 	s->release();
 	return true;

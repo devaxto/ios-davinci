@@ -18,7 +18,7 @@ Never flash/boot a metal image when chasing smoothness.
 
 | Area | Status | What “perfect” means next |
 | --- | --- | --- |
-| Display present | **good** (0091 flip + cache) | Stable 60 Hz flip; no memcpy; measure `flips N` in log |
+| Display present | **0095** logical→panel crop flip | `flips` rising; present us near 0; no 10 MB memcpy |
 | Touch (GT9896) | **works** | Edge gestures, no drops, low latency |
 | Keys / buttons | **works** | Volume + power |
 | USB gadget | **works** (device enum) | Stable adb-over-USB later; no reset loops |
@@ -35,8 +35,12 @@ Never flash/boot a metal image when chasing smoothness.
 3. Only then touch lab GPU (`sweetgpu=5`) on a throwaway boot.
 4. Broaden other drivers only when the home screen stays smooth.
 
-## Lab GPU note
+## GPU vs smoothness (honest)
+
+Until AGX→a6xx (years), “GPU support” does **not** make SpringBoard smooth.
+What does: DPU **flip** of the buffer CA already drew (0095 crop flip).
+Adreno ring/blit is lab-only proof we can move pixels later for *our*
+compositor path — never enable `sweetgpu>=2` on a feel boot.
 
 Vendor FW is in `fw/` (`a618_gmu.bin`, `a630_sqe.fw`, `a615_zap.*`). Embedded
-in 0093+. Bring-up timeouts are soft (milliseconds). Failures must not
-hang the CPUs or the display path.
+in 0093+. Bring-up timeouts are soft (milliseconds).
