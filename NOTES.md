@@ -9,8 +9,11 @@ Re-embed Xiaomi vendor blobs into the kernel (B0 → bring-up):
 `0093-davinci-vendor-gmu-sqe.patch`. Still `sweetgpu=5` for SQE/ring test;
 daily stays 0091 / `sweetgpu=1`.
 
-**Next:** CI → `shim-boot-0093-metal.img` → `fastboot boot` → log for
-`GMU CM3 UP` / `SQE RING IDLE` with the real vendor microcode.
+**CI + boot:** commit `86f10cb`. Run **40976741057** SUCCESS →
+`xnu/out-0093`. Image `shim/out/shim-boot-0093-metal.img` (sha256
+`db29581b091ee051aa3cbc7da31608d86aee9a27828300ee2241fbdf2f7a42e0`),
+cmdline = daily + `sweetgpu=5`. **Booted** 2026-10-30 ~01:07 (`fastboot
+boot` OKAY). Await log: `GMU CM3 UP` / `SQE RING IDLE` / SMMU_STALL.
 
 ---
 
