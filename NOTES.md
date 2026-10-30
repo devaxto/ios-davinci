@@ -17,11 +17,11 @@ per stage. Still never put `sweetgpu>=2` on a feel-test image.
 
 **Ready now:** `shim/out/shim-boot-0093.img` (sha256
 `4786fd15f0eff246f92c5af247820324d4f6fade7699d41554a5ffa9613d282e`) =
-0093 kernel + **sweetgpu=1** + flip/noconsole/cache/cpus=8. **Boot this**
-the moment the phone is in fastboot (`fastboot boot shim/out/shim-boot-0093.img`).
-Fallback: `shim-boot-0091.img`.
+0093 kernel + **sweetgpu=1** + flip/noconsole/cache/cpus=8.
+**Booted** 2026-10-30 ~01:13 (`fastboot boot` OKAY via watcher). Fallback:
+`shim-boot-0091.img`.
 
-**Next:** boot daily → confirm feel; scoreboard in NATIVE-DRIVERS.md
+**Next:** user confirms feel vs metal; scoreboard in NATIVE-DRIVERS.md
 (display flip → touch → power). GPU lab only after home screen is good.
 
 ---
