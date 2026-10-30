@@ -2,6 +2,21 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - 0096 performance: safe flip + fast crop-copy (read first) <<<
+
+User wants better performance. GPU still cannot paint SB. Path that can:
+
+1. **Revert 0095 crop-flip** (scrambled scanout by retuning YSTRIDE).
+2. **Fast crop-copy**: single full logical layer → tight row loop into the
+   ABL panel buffer (DPU never retuned). Log `SWEET FB: crop-copy`.
+3. **Feel experiment image**: same kernel + `sweetfb_native=1` so CA draws
+   at panel size and safe flip can hit (may regress status-bar layout).
+
+Daily default stays logical iPhone X + crop-copy. Boot
+`shim-boot-0096.img`; try `shim-boot-0096-native.img` if still laggy.
+
+---
+
 ### >>> UPDATE 2026-10-30 - 0095 REGRESSION; recover 0091 (read first) <<<
 
 User: 0095 “va sempre più di merda”. **Revert path:** boot
