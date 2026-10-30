@@ -38,11 +38,11 @@ panel), not by registering a fake `AGXAccelerator`.
 4. Firmware blobs stay in `fw/` (gitignored). Only `fw/manifest.txt`
    hashes may be committed.
 
-## Immediate next (B2)
+## Immediate next
 
-`sweetgpu=5` (patch 0092) loads SQE, programs the CP ring, submits
-`CP_ME_INIT` + `CP_NOP`. Boot the metal image and look for
-`SWEET GPU: SQE RING IDLE` (or `SMMU_STALL` / `TIMEOUT` which names the
-next fix). After RPTR advances: clear/blit into splash (prove pixels).
+**GUI feel is Track A / `docs/NATIVE-DRIVERS.md` — not this file.** Do not
+boot `*-metal.img` while chasing smoothness.
 
-Daily GUI stays on 0091 / `sweetgpu=1`. Do not enable `sweetgpu=3`.
+Lab only, after the daily image feels fine: `sweetgpu=5` → log
+`SQE RING IDLE` / `SMMU_STALL`; then clear/blit into splash. Never
+`sweetgpu=3` on daily.

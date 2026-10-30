@@ -13,7 +13,9 @@
  *
  * sweetgpu=3 can make Metal prefer a stub that is not yet a real driver;
  * keep the working software compositor unless you are tracing selectors.
- * See docs/GPU.md and docs/METAL-PORT.md.
+ * DAILY GUI boots MUST use sweetgpu<=1. Modes 2-5 are lab-only: they poke
+ * GMU/SQE and make SpringBoard feel worse when the bring-up fails/stalls.
+ * See docs/GPU.md, docs/METAL-PORT.md, docs/NATIVE-DRIVERS.md.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -442,7 +444,7 @@ gpu_gmu_set_oob(uint32_t set_bit, uint32_t ack_bit, const char *name)
 	int i;
 
 	gmu_wr(REG_A6XX_GMU_HOST2GMU_INTR_SET, 1u << set_bit);
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < 500; i++) {
 		val = gmu_rd(REG_A6XX_GMU_GMU2HOST_INTR_INFO);
 		if (val & (1u << ack_bit)) {
 			gmu_wr(REG_A6XX_GMU_GMU2HOST_INTR_CLR, 1u << ack_bit);
@@ -529,7 +531,7 @@ gpu_gmu_start_legacy(bool with_hfi)
 	delay(100);
 	gmu_wr(REG_A6XX_GMU_CM3_SYSRESET, 0);
 
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < 500; i++) {
 		val = gmu_rd(REG_A6XX_GMU_CM3_FW_INIT_RESULT);
 		if ((val & mask) == want) {
 			g_gmu_up = true;
@@ -586,7 +588,7 @@ gpu_hfi_ctrl_start(void)
 	int i;
 
 	gmu_wr(REG_A6XX_GMU_HFI_CTRL_INIT, 1);
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < 500; i++) {
 		val = gmu_rd(REG_A6XX_GMU_HFI_CTRL_STATUS);
 		if (val & 1u) {
 			printf("SWEET GPU: HFI ctrl UP status 0x%08x (%d us)\n",
@@ -693,7 +695,7 @@ gpu_sqe_ring_bringup(void)
 	agpu_wr(REG_A6XX_CP_RB_WPTR, wptr);
 	printf("SWEET GPU: submitted ME_INIT+NOP wptr=%u\n", wptr);
 
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < 500; i++) {
 		rptr = agpu_rd(REG_A6XX_CP_RB_RPTR);
 		status = agpu_rd(REG_A6XX_RBBM_STATUS);
 		status3 = agpu_rd(REG_A6XX_RBBM_STATUS3);

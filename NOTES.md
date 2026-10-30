@@ -2,6 +2,30 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-30 - STOP metal-on-GUI; native drivers first (read first) <<<
+
+User: "da male in peggio" / wants native drivers perfect. **Observation:**
+booting `*-metal.img` (`sweetgpu=5`) does not paint SpringBoard and makes
+the phone feel worse (GMU/SQE bring-up on the boot path). That was us,
+not "more GPU = smoother".
+
+**Policy:** daily = `shim-boot-0093.img` or `shim-boot-0091.img` with
+`sweetgpu=1` only. Lab metal stays separate. See `docs/NATIVE-DRIVERS.md`.
+
+**0094:** soft-fail GPU polls (5 ms caps) so a lab boot cannot spin ~100 ms
+per stage. Still never put `sweetgpu>=2` on a feel-test image.
+
+**Ready now:** `shim/out/shim-boot-0093.img` (sha256
+`4786fd15f0eff246f92c5af247820324d4f6fade7699d41554a5ffa9613d282e`) =
+0093 kernel + **sweetgpu=1** + flip/noconsole/cache/cpus=8. **Boot this**
+the moment the phone is in fastboot (`fastboot boot shim/out/shim-boot-0093.img`).
+Fallback: `shim-boot-0091.img`.
+
+**Next:** boot daily → confirm feel; scoreboard in NATIVE-DRIVERS.md
+(display flip → touch → power). GPU lab only after home screen is good.
+
+---
+
 ### >>> UPDATE 2026-10-30 - 0093 vendor GMU/SQE embedded (read first) <<<
 
 Re-embed Xiaomi vendor blobs into the kernel (B0 → bring-up):
