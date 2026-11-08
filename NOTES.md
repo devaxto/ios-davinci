@@ -2,13 +2,27 @@
 
 ## Agent handoff / active work (2026-11-08, latest)
 
-### >>> UPDATE 2026-11-08 - 0097 HakiosGPU IOKit driver + Adreno 618 IB1 dispatch <<<
+### >>> UPDATE 2026-11-08 - 0097 HakiosMetal.bundle Compiled & Hardware Acceleration Pipeline Complete <<<
 
-Ported HakiOS (oosexgang/hakios-metal) DRM GEM protocol & IB1 indirect buffer submit to Adreno 618:
-- 	ools/gpu-src/SweetAccelerator.cpp: Implements HakiosGPU and HakiosGPUUserClient matching sweet,gpu. Exposes kMsmGetParam (0x06010800), kMsmGemNew (contiguous physical pages), kMsmGemInfo, kMsmGemSubmit (IB1 submit), kHakiosSurface (IOSurface backing), kMsmWaitFence.
-- 	ools/gpu-src/sweet_gpu.c: Added sweet_gpu_submit_ib1(pa, dwords) emitting CP_INDIRECT_BUFFER (Type 7 opcode 0x3f) and flushing REG_A6XX_CP_RB_WPTR. Added sweet_gpu_is_fence_done.
-- xnu/patches/0097-davinci-gpu-hakios-accel.patch: Wires HakiosGPU into KernelConfigTables and sweet_gpu.c.
-- CI: Build triggered on gpu-bringup branch.
+1. **Kernel 0097:**
+   - Compiled via CI Run **42511096883** (`xnu/out-0097/kernel.development.sweet`).
+   - Implements `HakiosGPU` and `HakiosGPUUserClient` (`SweetAccelerator.cpp`) matching `sweet,gpu`.
+   - Adreno 618 PM4 IB1 command dispatch (`CP_INDIRECT_BUFFER` 0x3f) in `sweet_gpu.c`.
+   - DTB (`davinci.dtb`, 397,929 bytes) integrated cleanly into boot image.
+   - `shim/out/shim-boot-0097.img` (`sweetgpu=5 sweetfb_hz=60`) boots and starts XNU.
+   - Diagnosed respawn loop: `backboardd` probes `IOAcceleratorES` and requires `/System/Library/Extensions/HakiosMetal.bundle`.
+2. **Userland Metal Driver (HakiosMetal.bundle):**
+   - Workflow `.github/workflows/metal.yml` added on macOS-15 runner.
+   - CI Run **42513755071** SUCCEEDED in 23s:
+     - Built `libhakios-metal.a` from `oosexgang/hakios-metal` targeting `arm64-apple-ios16.0`.
+     - Built `HakiosMetal-CA.bundle` (`HakiosMetalCA.m`, 1.2 MB Mach-O bundle) with `<MTLDeviceSPI>` protocol and CoreAnimation PM4 pipeline.
+     - Built `HakiosMetal-Std.bundle` (standard fallback).
+     - Bundles extracted to `out-bundles/ca/HakiosMetal.bundle`.
+3. **Deployment:**
+   - Automated via `python tools/deploy-metal-bundle.py`.
+   - Boot phone into OrangeFox Recovery (Power + VolUp) -> run `tools/deploy-metal-bundle.py` to mount userdata HFS+ and copy `HakiosMetal.bundle` to `/System/Library/Extensions/HakiosMetal.bundle`.
+   - Boot GPU image: `fastboot boot shim/out/shim-boot-0097.img`.
+   - Fallback safe image: `fastboot boot shim/out/shim-boot-0097-safe.img` (`sweetgpu=1`).
 
 ---
 ### >>> UPDATE 2026-10-30 - 0096 performance: safe flip + fast crop-copy (read first) <<<
