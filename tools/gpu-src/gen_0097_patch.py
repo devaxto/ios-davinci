@@ -44,11 +44,20 @@ def main() -> None:
 
     new_accel = (SRC / "SweetAccelerator.cpp").read_text(encoding="utf-8")
 
-    # old sweet_gpu.c before our add_funcs
-    # we can diff against git HEAD
-    import subprocess
-    proc = subprocess.run(["git", "show", "HEAD:tools/gpu-src/sweet_gpu.c"], cwd=ROOT, capture_output=True, text=True)
-    old_gpu = proc.stdout
+    # old sweet_gpu.c comes from 0094-sweet-gpu-soft-fail.patch
+    p94 = (ROOT / "xnu" / "patches" / "0094-sweet-gpu-soft-fail.patch").read_text(encoding="utf-8")
+    marker_gpu = "+++ b/bsd/dev/sweet_gpu.c\n"
+    idx_gpu = p94.find(marker_gpu)
+    assert idx_gpu != -1, "sweet_gpu.c not found in 0094 patch"
+    idx_gpu = p94.find("@@", idx_gpu)
+    idx_gpu = p94.find("\n", idx_gpu) + 1
+    gpu_lines = []
+    for l in p94[idx_gpu:].splitlines():
+        if l.startswith("+"):
+            gpu_lines.append(l[1:])
+        elif l.startswith("diff ") or l.startswith("--- "):
+            break
+    old_gpu = "\n".join(gpu_lines) + "\n"
     new_gpu = (SRC / "sweet_gpu.c").read_text(encoding="utf-8")
 
     kconfig_hunk = """--- a/iokit/KernelConfigTables.cpp

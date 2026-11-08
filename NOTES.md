@@ -22,7 +22,9 @@
    - Log showed: `SWEET GPU: CBCR memnoc-gfx stuck off (0x80000221) -> power-on FAILED`.
    - On SM7150 `memnoc-gfx` and `snoc-dvm` are delayed-halt branches (`BRANCH_HALT_DELAY` in Linux `gcc-sm7150.c`), asserting ACK only when downstream AXI traffic flows.
    - Updated `gpu_cbcr_enable()` in `sweet_gpu.c` to enable without spinning on the halt bit for delayed branches, matching Linux GCC driver behavior.
-   - Triggered CI run **42517358377** on `gpu-bringup`.
+   - CI Run **42517358377** SUCCEEDED in 8m39s (`xnu/out-0097-p2/xnu-kernel/kernel.development.sweet`).
+   - Built `shim/out/shim-boot-0097-p2.img` with `davinci.dtb` and full display/touch flags (`sweetfb_cache=1 sweetdpu=1 davinci_touch_probeonly=0 sweetfb_flip=1 sweetgpu=5 sweetfb_noconsole=1 sweetfb_hz=60`).
+   - Dispatched to `aa20029b` via `fastboot boot shim/out/shim-boot-0097-p2.img` (OKAY).
 3. **Deployment & Boot Execution:**
    - Pulled and analyzed persistent crash log `logs/boot-0097-crash.txt` (1.8 MB). Discovered `backboardd` was healthy; SpringBoard set up homescreen traits and was crashing on ACM (AppleCredentialManager).
    - Identified that without `sweetfb_noconsole=1`, kernel text console continuously drew over the GUI on every log line.
