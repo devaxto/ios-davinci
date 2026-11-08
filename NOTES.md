@@ -2,6 +2,76 @@
 
 ## Agent handoff / active work (2026-11-08, latest)
 
+### >>> UPDATE 2026-11-08 ~23:50 - 0097 HakiosGPU ate the GUI; 0096 recovery boot <<<
+
+1. **1h boot log** `logs/boot-0097-native-quiet-1h.txt` (447 KB, flush #622):
+   - `sweetfb_native=1` WORKED: `presented as 1080x2340`, **0** SpringBoard
+     BoundingPath crashes (fix vs prior 0097-visible loop).
+   - But GUI never arrived: only **2** swaps / **4** crop-copies in ~1h,
+     Apple logo + kprintf feel. Tail = fairplayd/bluetoothd exec spam.
+   - Root cause: `SWEET GPU: HakiosGPU online for Metal (chip 0x00000000)`
+     even with `sweetgpu=1`. backboardd matches `IOAcceleratorES` →
+     HakiosGPU; CA binds the stub Metal path and stalls. Old AGX stub
+     had `sweet_gpu_mode() < 3` → return false; 0097 dropped that gate.
+
+2. **Immediate recovery (booted):** `shim-boot-0096-native-quiet.img`
+   sha256 `d397d139cc8ec3296dfe4571456b146a77eaf0a152f92004f414f50e1f4f69f6`
+   = 0096 kernel (no HakiosGPU) + `sweetfb_native=1 sweetfb_noconsole=1
+   sweetgpu=1`. fastboot OKAY ~23:50 local. Await user: should get past
+   Apple logo to SB (layout may be native-odd).
+
+3. **0097 fix:** `HakiosGPU::start` now refuses unless `sweet_gpu_mode()>=3`
+   (tools/gpu-src/SweetAccelerator.cpp + regenerated
+   `0097-davinci-gpu-hakios-accel.patch`). Needs CI rebuild then
+   `shim-boot-0097-native-quiet` again.
+
+4. Fallback if 0096-native-quiet still bad: `shim-boot-0096.img` (iPhone X
+   logical, known homescreen path historically) or `shim-boot-0091.img`.
+
+---
+### >>> UPDATE 2026-11-08 ~21:52 - 0097-native-quiet (console was eating the panel) <<<
+
+1. **User report:** 0097-native ran ~13 min "emanando logs" / doing nothing.
+   **Cause (observation):** booted without `sweetfb_noconsole=1`, so
+   `-enable_kprintf_spam` kept painting the kernel console over the panel
+   and hid any GUI. Not a new crash by itself.
+
+2. **Gentle fix image:** `shim/out/shim-boot-0097-native-quiet.img`
+   = same CI kernel `xnu/out-0097-ci` + cmdline
+   `sweetfb_native=1 sweetfb_noconsole=1 sweetgpu=1 sweetfb_flip=0`.
+   Keeps BoundingPath bypass; stops console over GUI. Logs still go to
+   the UFS console partition for later pull.
+
+3. **Booted** 2026-11-08 ~22:03 local on davinci `aa20029b`:
+   `fastboot boot shim-boot-0097-native-quiet.img` OKAY (0.391s / 0.136s).
+   Expect: no scrolling kernel text; SpringBoard at 1080x2340.
+   Layout/status-bar may still look wrong (native tradeoff).
+   Await user feel; pull log from recovery when done.
+
+4. Fallback: `shim-boot-0097-safe.img` (no native, still has BoundingPath risk).
+
+---
+### >>> UPDATE 2026-11-08 late - 0097-native booted on davinci (SB BoundingPath fix) <<<
+
+1. **CI 0097 fixed kernel READY:** run **42519926123** SUCCESS.
+   Kernel `xnu/out-0097-ci/kernel.development.sweet` sha256
+   `7778a77e9b16e97d1bdffe59045180a71815986f2493c3eb89a87d5449ab8254`.
+
+2. **Built + booted native image on Mi 9T (davinci `aa20029b`):**
+   - Image `shim/out/shim-boot-0097-native.img` (17281024 B) sha256
+     `30e3a321854648d4f93854118738b4d5d0c530ac6808897a0614ce8a3b8f5cea`
+   - Cmdline: daily feel (`sweetgpu=1`, `sweetfb_flip=0`) + **`sweetfb_native=1`**
+     to stop SpringBoard BoundingPathBitmap-1125x2436 crash loop.
+   - From OrangeFox → `adb reboot bootloader` → `fastboot boot` OKAY
+     (send 0.390s, boot 0.137s, total 0.537s) at ~21:35 local.
+   - **Mistake:** missing `sweetfb_noconsole=1` → panel flooded with kprintf.
+
+3. Pull log after recovery: `python tools/sweet-log-pull.py logs/boot-0097-native.txt`
+   Look for `presented as 1080x2340` and **no** `BoundingPathBitmap-1125x2436`.
+
+4. Superseded by **0097-native-quiet** above.
+
+---
 ### >>> UPDATE 2026-11-08 - 0097 Patch Application Root Cause & SpringBoard Loop Diagnostic <<<
 
 1. **Patch 0097 Rejection Root Cause Discovered:**

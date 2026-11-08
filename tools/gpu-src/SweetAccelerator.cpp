@@ -1,9 +1,12 @@
 /*
  * DAVINCI / SWEET: Adreno 618 IOKit Accelerator & DRM Engine.
  *
- * Exposes HakiosGPU and AGXAccelerator for Metal / CoreAnimation.
- * Answers msm DRM requests (kMsmGemNew, kMsmGemSubmit, kHakiosSurface)
- * and dispatches PM4 command streams directly to the Adreno 618 CP ring.
+ * Exposes HakiosGPU for Metal / CoreAnimation lab boots (sweetgpu>=3).
+ * DAILY GUI must keep sweetgpu<=1 so this service does NOT register:
+ * otherwise CoreAnimation binds IOAcceleratorES→HakiosGPU and stalls
+ * with almost no swaps (Apple logo forever). Answers msm DRM requests
+ * (kMsmGemNew, kMsmGemSubmit, kHakiosSurface) and dispatches PM4 to the
+ * Adreno 618 CP ring when SQE is up.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <IOKit/IOService.h>
@@ -109,6 +112,11 @@ OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
 bool
 HakiosGPU::start(IOService *provider)
 {
+	/* Same gate as the old AGXAccelerator stub: never publish an
+	 * IOAcceleratorES on daily sweetgpu<=1 boots. */
+	if (sweet_gpu_mode() < 3) {
+		return false;
+	}
 	if (!IOAcceleratorES::start(provider)) {
 		return false;
 	}
