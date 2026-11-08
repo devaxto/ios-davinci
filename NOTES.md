@@ -18,6 +18,11 @@
      - Built `HakiosMetal-CA.bundle` (`HakiosMetalCA.m`, 1.2 MB Mach-O bundle) with `<MTLDeviceSPI>` protocol and CoreAnimation PM4 pipeline.
      - Built `HakiosMetal-Std.bundle` (standard fallback).
      - Bundles extracted to `out-bundles/ca/HakiosMetal.bundle`.
+2. **GPU Clock Domain Power Sequencing Fix (2fa58db):**
+   - Log showed: `SWEET GPU: CBCR memnoc-gfx stuck off (0x80000221) -> power-on FAILED`.
+   - On SM7150 `memnoc-gfx` requires `CX_GDSC` enabled *before* clock un-gating.
+   - Fixed `gpu_power_on()` in `sweet_gpu.c` to enable `CX_GDSC` before `memnoc-gfx` and `cx-gmu`.
+   - Triggered CI run **42515796069** on `gpu-bringup`.
 3. **Deployment & Boot Execution:**
    - Pulled and analyzed persistent crash log `logs/boot-0097-crash.txt` (1.8 MB). Discovered `backboardd` was healthy; SpringBoard set up homescreen traits and was crashing on ACM (AppleCredentialManager).
    - Identified that without `sweetfb_noconsole=1`, kernel text console continuously drew over the GUI on every log line.
