@@ -2,34 +2,27 @@
 
 ## Agent handoff / active work (2026-11-08, latest)
 
-### >>> UPDATE 2026-11-08 - 0097 HakiosMetal.bundle Compiled & Hardware Acceleration Pipeline Complete <<<
+### >>> UPDATE 2026-11-08 - 0097 Patch Application Root Cause & SpringBoard Loop Diagnostic <<<
 
-1. **Kernel 0097:**
-   - Compiled via CI Run **42511096883** (`xnu/out-0097/kernel.development.sweet`).
-   - Implements `HakiosGPU` and `HakiosGPUUserClient` (`SweetAccelerator.cpp`) matching `sweet,gpu`.
-   - Adreno 618 PM4 IB1 command dispatch (`CP_INDIRECT_BUFFER` 0x3f) in `sweet_gpu.c`.
-   - DTB (`davinci.dtb`, 397,929 bytes) integrated cleanly into boot image.
-   - `shim/out/shim-boot-0097.img` (`sweetgpu=5 sweetfb_hz=60`) boots and starts XNU.
-   - Diagnosed respawn loop: `backboardd` probes `IOAcceleratorES` and requires `/System/Library/Extensions/HakiosMetal.bundle`.
-2. **Userland Metal Driver (HakiosMetal.bundle):**
-   - Workflow `.github/workflows/metal.yml` added on macOS-15 runner.
-   - CI Run **42513755071** SUCCEEDED in 23s:
-     - Built `libhakios-metal.a` from `oosexgang/hakios-metal` targeting `arm64-apple-ios16.0`.
-     - Built `HakiosMetal-CA.bundle` (`HakiosMetalCA.m`, 1.2 MB Mach-O bundle) with `<MTLDeviceSPI>` protocol and CoreAnimation PM4 pipeline.
-     - Built `HakiosMetal-Std.bundle` (standard fallback).
-     - Bundles extracted to `out-bundles/ca/HakiosMetal.bundle`.
-2. **GPU Clock Domain Power Sequencing Fix (2fa58db & 628d54a):**
-   - Log showed: `SWEET GPU: CBCR memnoc-gfx stuck off (0x80000221) -> power-on FAILED`.
-   - On SM7150 `memnoc-gfx` and `snoc-dvm` are delayed-halt branches (`BRANCH_HALT_DELAY` in Linux `gcc-sm7150.c`), asserting ACK only when downstream AXI traffic flows.
-   - Updated `gpu_cbcr_enable()` in `sweet_gpu.c` to enable without spinning on the halt bit for delayed branches, matching Linux GCC driver behavior.
-   - CI Run **42517358377** SUCCEEDED in 8m39s (`xnu/out-0097-p2/xnu-kernel/kernel.development.sweet`).
-   - Built `shim/out/shim-boot-0097-p2.img` with `davinci.dtb` and full display/touch flags (`sweetfb_cache=1 sweetdpu=1 davinci_touch_probeonly=0 sweetfb_flip=1 sweetgpu=5 sweetfb_noconsole=1 sweetfb_hz=60`).
-   - Dispatched to `aa20029b` via `fastboot boot shim/out/shim-boot-0097-p2.img` (OKAY).
-3. **Deployment & Boot Execution:**
-   - Pulled and analyzed persistent crash log `logs/boot-0097-crash.txt` (1.8 MB). Discovered `backboardd` was healthy; SpringBoard set up homescreen traits and was crashing on ACM (AppleCredentialManager).
-   - Identified that without `sweetfb_noconsole=1`, kernel text console continuously drew over the GUI on every log line.
-   - Built `shim/out/shim-boot-0097-gui.img` with `sweetgpu=5 sweetfb_hz=60 sweetfb_noconsole=1` + `davinci.dtb`.
-   - Executed `fastboot boot shim/out/shim-boot-0097-gui.img` on device `aa20029b` (Sending OKAY, Booting OKAY). Display console now releases to CoreAnimation GUI on first swap.
+1. **Patch 0097 Rejection Root Cause Discovered:**
+   - Persistent boot log `logs/boot-0097-visible.txt` (1.74 MB) still logged `SWEET GPU: CBCR memnoc-gfx stuck off (0x80000221)`.
+   - Investigation revealed why: `gen_0097_patch.py` previously generated diff against git HEAD (825 lines) instead of the 794 lines resulting from `0094-sweet-gpu-soft-fail.patch`.
+   - In CI, `patch -p1` failed the line-count/content match and silently rejected the `bsd/dev/sweet_gpu.c` hunk, leaving the old 0094 GPU code active in the kernel.
+   - Fixed `gen_0097_patch.py` to extract exact 794 lines from `0094-sweet-gpu-soft-fail.patch`.
+   - Hardened `gpu_cbcr_enable()` to check exact register offsets `(off == GCC_GPU_MEMNOC_GFX || off == GCC_GPU_SNOC_DVM_GFX)` instead of relying on `strcmp`.
+   - Committed (`7a66800`) and triggered CI Run **42519926123**.
+
+2. **SpringBoard ReportCrash Loop Diagnosed:**
+   - Log shows unmuted console scrolling:
+     `*** Assertion failure in -[_UIScreenComplexBoundingPathUtilities _loadBitmapForScreen:type:], _UIScreenComplexBoundingPathUtilities.m:326`
+     `reason: 'Failed to load bounding path bitmap data from the asset manager for asset name: BoundingPathBitmap-1125x2436-375x812-3.00x'`
+     `CRASH SpringBoard[26] sig 6`
+   - Triggered because UIKit tries to load iPhone X notch asset for 1125x2436 logical canvas when Cryptex1 is unmounted (`ignition_level < 2`).
+   - Fix: boot-arg `sweetfb_native=1` presents native panel bounds (`1080x2340`/`1080x2400`), bypassing the notch asset lookup cleanly.
+
+3. **Userland Driver Delivery:**
+   - `HakiosMetal.bundle` (1.2 MB Mach-O bundle) is compiled and ready in `out-bundles/ca/HakiosMetal.bundle`.
+   - Recovery environment has native Python 3.10.4 (`/system/bin/python`).
 
 ---
 ### >>> UPDATE 2026-10-30 - 0096 performance: safe flip + fast crop-copy (read first) <<<
