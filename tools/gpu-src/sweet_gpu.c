@@ -331,20 +331,21 @@ gpu_power_on(void)
 {
 	printf("SWEET GPU: power-on CX + clocks (sweetgpu=%d)\n", g_mode);
 	if (!gpu_cbcr_enable(g_gcc, GCC_GPU_CFG_AHB, 0, "cfg-ahb") ||
-	    !gpu_cbcr_enable(g_gcc, GCC_GPU_MEMNOC_GFX, 0, "memnoc-gfx") ||
-	    !gpu_cbcr_enable(g_gcc, GCC_GPU_SNOC_DVM_GFX, 0, "snoc-dvm") ||
 	    !gpu_cbcr_enable(g_gcc, GCC_DDRSS_GPU_AXI, 0, "ddrss-axi")) {
 		return false;
 	}
 	if (!gpu_cbcr_enable(g_gpucc, GPUCC_CXO_AON_CBCR, 0, "cxo-aon") ||
-	    !gpu_cbcr_enable(g_gpucc, GPUCC_CRC_AHB_CBCR, 0, "crc-ahb") ||
-	    !gpu_cbcr_enable(g_gpucc, GPUCC_CX_SNOC_DVM_CBCR, 0, "cx-snoc")) {
+	    !gpu_cbcr_enable(g_gpucc, GPUCC_CRC_AHB_CBCR, 0, "crc-ahb")) {
 		return false;
 	}
+	/* CX power domain must be enabled BEFORE CX-dependent clocks (memnoc, gmu, cxo) */
 	if (!gpu_cx_enable()) {
 		return false;
 	}
-	if (!gpu_cbcr_enable(g_gpucc, GPUCC_CX_GMU_CBCR, CBCR_SLEEP_WAKE, "cx-gmu") ||
+	if (!gpu_cbcr_enable(g_gcc, GCC_GPU_MEMNOC_GFX, 0, "memnoc-gfx") ||
+	    !gpu_cbcr_enable(g_gcc, GCC_GPU_SNOC_DVM_GFX, 0, "snoc-dvm") ||
+	    !gpu_cbcr_enable(g_gpucc, GPUCC_CX_SNOC_DVM_CBCR, 0, "cx-snoc") ||
+	    !gpu_cbcr_enable(g_gpucc, GPUCC_CX_GMU_CBCR, CBCR_SLEEP_WAKE, "cx-gmu") ||
 	    !gpu_cbcr_enable(g_gpucc, GPUCC_CXO_CBCR, 0, "cxo")) {
 		return false;
 	}
