@@ -1,0 +1,82 @@
+name: metal-plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - gpu-bringup
+    paths:
+      - "tools/HakiosMetalCA.m"
+      - "tools/HakiosMetal.plist"
+      - ".github/workflows/metal.yml"
+
+jobs:
+  build-bundle:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Fetch hakios-metal
+        run: |
+          git clone --depth 1 https://github.com/oosexgang/hakios-metal.git hakios-metal
+
+      - name: Build libhakios-metal.a
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p hakios-metal/out/ios/obj
+          cd hakios-metal
+          for f in src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp src/fake_gpu.cpp src/iokit_transport.cpp; do
+            echo "Compiling $f..."
+            xcrun clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -std=c++17 -O2 -Wall -Wextra -Iinclude -c "$f" -o "out/ios/obj/$(basename "$f" .cpp).o"
+          done
+          ar rcs out/ios/libhakios-metal.a out/ios/obj/*.o
+          ls -lh out/ios/libhakios-metal.a
+          cd ..
+
+      - name: Build HakiosMetalCA bundle
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out/bundle_ca/HakiosMetal.bundle
+          echo "Building HakiosMetalCA bundle..."
+          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 \
+            -bundle \
+            -framework Foundation -framework IOKit -framework IOSurface -framework Metal -lobjc \
+            -Ihakios-metal/include \
+            -DHAKIOS_METAL_GPU \
+            -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function \
+            tools/HakiosMetalCA.m hakios-metal/out/ios/libhakios-metal.a -lc++ \
+            -o out/bundle_ca/HakiosMetal.bundle/HakiosMetal
+          cp tools/HakiosMetal.plist out/bundle_ca/HakiosMetal.bundle/Info.plist
+          codesign -s - -f out/bundle_ca/HakiosMetal.bundle/HakiosMetal || true
+          cd out/bundle_ca && zip -r ../HakiosMetal-CA.bundle.zip HakiosMetal.bundle && cd ../..
+
+      - name: Build HakiosMetal standard plugin bundle
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out/bundle_std/HakiosMetal.bundle
+          echo "Building HakiosMetal standard bundle..."
+          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 \
+            -bundle \
+            -framework Foundation -framework Metal -lobjc -framework IOKit -framework IOSurface \
+            -Ihakios-metal/include -Ihakios-metal/plugin \
+            -DHAKIOS_METAL_GPU \
+            -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function \
+            hakios-metal/plugin/HakiosMetal.m hakios-metal/plugin/hakios_metallib.c hakios-metal/out/ios/libhakios-metal.a -lc++ \
+            -o out/bundle_std/HakiosMetal.bundle/HakiosMetal
+          cp tools/HakiosMetal.plist out/bundle_std/HakiosMetal.bundle/Info.plist
+          codesign -s - -f out/bundle_std/HakiosMetal.bundle/HakiosMetal || true
+          cd out/bundle_std && zip -r ../HakiosMetal-Std.bundle.zip HakiosMetal.bundle && cd ../..
+
+      - name: Upload Bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: HakiosMetal-bundles
+          path: out/*.zip
+          retention-days: 7
