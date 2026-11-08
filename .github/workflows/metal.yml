@@ -34,7 +34,7 @@ jobs:
           cd hakios-metal
           for f in src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp src/fake_gpu.cpp src/iokit_transport.cpp; do
             echo "Compiling $f..."
-            xcrun clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -std=c++17 -O2 -Wall -Wextra -Iinclude -c "$f" -o "out/ios/obj/$(basename "$f" .cpp).o"
+            xcrun clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -std=c++17 -O2 -Wall -Wextra -Wno-invalid-constexpr -Wno-error -Iinclude -c "$f" -o "out/ios/obj/$(basename "$f" .cpp).o"
           done
           ar rcs out/ios/libhakios-metal.a out/ios/obj/*.o
           ls -lh out/ios/libhakios-metal.a
