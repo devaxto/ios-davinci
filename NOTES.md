@@ -18,11 +18,11 @@
      - Built `HakiosMetal-CA.bundle` (`HakiosMetalCA.m`, 1.2 MB Mach-O bundle) with `<MTLDeviceSPI>` protocol and CoreAnimation PM4 pipeline.
      - Built `HakiosMetal-Std.bundle` (standard fallback).
      - Bundles extracted to `out-bundles/ca/HakiosMetal.bundle`.
-3. **Deployment:**
-   - Automated via `python tools/deploy-metal-bundle.py`.
-   - Boot phone into OrangeFox Recovery (Power + VolUp) -> run `tools/deploy-metal-bundle.py` to mount userdata HFS+ and copy `HakiosMetal.bundle` to `/System/Library/Extensions/HakiosMetal.bundle`.
-   - Boot GPU image: `fastboot boot shim/out/shim-boot-0097.img`.
-   - Fallback safe image: `fastboot boot shim/out/shim-boot-0097-safe.img` (`sweetgpu=1`).
+3. **Deployment & Boot Execution:**
+   - Pulled and analyzed persistent crash log `logs/boot-0097-crash.txt` (1.8 MB). Discovered `backboardd` was healthy; SpringBoard set up homescreen traits and was crashing on ACM (AppleCredentialManager).
+   - Identified that without `sweetfb_noconsole=1`, kernel text console continuously drew over the GUI on every log line.
+   - Built `shim/out/shim-boot-0097-gui.img` with `sweetgpu=5 sweetfb_hz=60 sweetfb_noconsole=1` + `davinci.dtb`.
+   - Executed `fastboot boot shim/out/shim-boot-0097-gui.img` on device `aa20029b` (Sending OKAY, Booting OKAY). Display console now releases to CoreAnimation GUI on first swap.
 
 ---
 ### >>> UPDATE 2026-10-30 - 0096 performance: safe flip + fast crop-copy (read first) <<<
