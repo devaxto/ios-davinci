@@ -22,7 +22,9 @@
    - Log showed: `SWEET GPU: CBCR memnoc-gfx stuck off (0x80000221) -> power-on FAILED`.
    - On SM7150 `memnoc-gfx` requires `CX_GDSC` enabled *before* clock un-gating.
    - Fixed `gpu_power_on()` in `sweet_gpu.c` to enable `CX_GDSC` before `memnoc-gfx` and `cx-gmu`.
-   - Triggered CI run **42515796069** on `gpu-bringup`.
+   - Triggered CI run **42515796069** on `gpu-bringup`. Completed successfully in 10m20s.
+   - Downloaded to `xnu/out-0097-fixed/xnu-kernel/kernel.development.sweet`.
+   - Built `shim/out/shim-boot-0097-hwaccel.img` with exact 0096 display flags (`sweetfb_cache=1 sweetdpu=1 davinci_touch_probeonly=0 sweetfb_flip=1`) + `sweetgpu=5`.
 3. **Deployment & Boot Execution:**
    - Pulled and analyzed persistent crash log `logs/boot-0097-crash.txt` (1.8 MB). Discovered `backboardd` was healthy; SpringBoard set up homescreen traits and was crashing on ACM (AppleCredentialManager).
    - Identified that without `sweetfb_noconsole=1`, kernel text console continuously drew over the GUI on every log line.
