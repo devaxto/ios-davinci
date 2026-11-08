@@ -130,6 +130,7 @@ bool sweet_gpu_sqe_up(void);
 #define CP_TYPE7_PKT              0x70000000u
 #define CP_ME_INIT                72u
 #define CP_NOP                    16u
+#define CP_INDIRECT_BUFFER        0x3fu
 
 static const struct {
 	const char *name;

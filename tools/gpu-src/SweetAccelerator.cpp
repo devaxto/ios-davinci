@@ -23,7 +23,6 @@ uint32_t sweet_gpu_chip_id(void);
 bool sweet_gpu_sqe_up(void);
 uint32_t sweet_gpu_submit_ib1(uint64_t pa, uint32_t dwords);
 bool sweet_gpu_is_fence_done(uint32_t fence);
-SweetSurface *sweet_surface_copy(uint32_t id);
 }
 
 enum {
