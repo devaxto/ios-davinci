@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/arm/SweetDisplay.cpp
++++ b/iokit/Kernel/arm/SweetDisplay.cpp
+@@ -16,7 +16,12 @@
+  */
+ #include "SweetDisplay.h"
+ 
+-#if defined(SWEET)
++/* MACHINE_FLAGS passes -DARM64_BOARD_CONFIG_SWEET; the MASTER `SWEET`
++ * config option is NOT visible to every optional iokitcpp TU. Using the
++ * board macro (same as sweet_gpu.c / SweetAccelerator.cpp) is what actually
++ * compiles the DPU probe+flip — otherwise only the #else stubs link and
++ * sweet_display_can_flip() is permanently false → 10 MB CPU present forever. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ #include <IOKit/IOLib.h>
+ #include <pexpert/pexpert.h>
+@@ -326,7 +331,7 @@
+ 	(void)sweet_display_flip(g_dpu.orig_pa, g_dpu.orig_stride);
+ }
+ 
+-#else /* !SWEET */
++#else /* !ARM64_BOARD_CONFIG_SWEET */
+ 
+ void
+ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,

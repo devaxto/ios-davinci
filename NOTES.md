@@ -2,31 +2,99 @@
 
 ## Agent handoff / active work (2026-11-08, latest)
 
-### >>> UPDATE 2026-11-08 ~23:50 - 0097 HakiosGPU ate the GUI; 0096 recovery boot <<<
+### >>> UPDATE 2026-11-09 ~00:35 - lag root cause = SweetDisplay stubs; GPU honesty <<<
 
-1. **1h boot log** `logs/boot-0097-native-quiet-1h.txt` (447 KB, flush #622):
-   - `sweetfb_native=1` WORKED: `presented as 1080x2340`, **0** SpringBoard
-     BoundingPath crashes (fix vs prior 0097-visible loop).
-   - But GUI never arrived: only **2** swaps / **4** crop-copies in ~1h,
-     Apple logo + kprintf feel. Tail = fairplayd/bluetoothd exec spam.
-   - Root cause: `SWEET GPU: HakiosGPU online for Metal (chip 0x00000000)`
-     even with `sweetgpu=1`. backboardd matches `IOAcceleratorES` →
-     HakiosGPU; CA binds the stub Metal path and stalls. Old AGX stub
-     had `sweet_gpu_mode() < 3` → return false; 0097 dropped that gate.
+1. **User wants:** kill rdar bar, kill lag, "full GPU acceleration".
 
-2. **Immediate recovery (booted):** `shim-boot-0096-native-quiet.img`
-   sha256 `d397d139cc8ec3296dfe4571456b146a77eaf0a152f92004f414f50e1f4f69f6`
-   = 0096 kernel (no HakiosGPU) + `sweetfb_native=1 sweetfb_noconsole=1
-   sweetgpu=1`. fastboot OKAY ~23:50 local. Await user: should get past
-   Apple logo to SB (layout may be native-odd).
+2. **Lag (smoking gun):** every shipped kernel has `sweet_display_*` as
+   **4-byte `ret` stubs**. `SWEET DPU:` / `SSPP` strings absent; nm shows
+   probe/can_flip/flip packed 4 B apart. Cause: `SweetDisplay.cpp` guarded
+   with `#if defined(SWEET)` but optional iokitcpp TUs reliably get
+   `-DARM64_BOARD_CONFIG_SWEET` (not MASTER `SWEET`) → only `#else` stubs
+   link → `can_flip` always false → forever ~10 MB CPU present. Matches
+   `sweetfb_flip=1 but DPU layer not found` with **zero** DPU probe logs.
 
-3. **0097 fix:** `HakiosGPU::start` now refuses unless `sweet_gpu_mode()>=3`
-   (tools/gpu-src/SweetAccelerator.cpp + regenerated
-   `0097-davinci-gpu-hakios-accel.patch`). Needs CI rebuild then
-   `shim-boot-0097-native-quiet` again.
+3. **Fix 0098:** `0098-sweet-display-board-ifdef.patch` switches the guard
+   to `ARM64_BOARD_CONFIG_SWEET` (like sweet_gpu / Hakios). CI next; then
+   feel boot should log `SWEET DPU: flip ready` + `flip surface`.
 
-4. Fallback if 0096-native-quiet still bad: `shim-boot-0096.img` (iPhone X
-   logical, known homescreen path historically) or `shim-boot-0091.img`.
+4. **rdar:45025538 red bar:** native 1080x2340 ≠ real iPhone size. Fix =
+   iPhone X 1125 + BoundingPath asset (or stay native and live with bar).
+   Separate from lag/GPU.
+
+5. **GPU acceleration (honest):** SpringBoard still draws `CA::OGL::SW`
+   until HakiosMetal completes CA frames (METAL-PORT B4+). Adreno bring-up
+   (0097 gate CI **42532517410** OK, kernel `xnu/out-0097-gate`) is lab:
+   `sweetgpu=5` + bundle deploy — does **not** replace DPU flip for feel.
+   Order: **0098 flip first** → then Hakios lab, not instead of.
+
+---
+### >>> UPDATE 2026-11-09 ~00:15 - GUI+touch work; rdar bar + lag next <<<
+
+1. **User:** works but laggy; red top bar emoji + `rdar:45025538`.
+2. **rdar (known):** native 1080x2340 = 360x780@3x is not a real iPhone
+   size → UIKit "No status bar visual provider" red bar. 1125x2436 (iPhone X)
+   fixes the bar but needs BoundingPath assets (or we stay native).
+3. **Lag:** Feel image **booted** ~00:29 local: `shim-boot-0096-feel.img`
+   (touch + native + `sweetfb_flip=1 sweetfb_cache=1 sweetdpu=1`). Await feel;
+   log should show `SWEET FB: flip surface` not only crop-copy. If scramble:
+   fall back to `shim-boot-0096-touch.img`.
+
+---
+### >>> UPDATE 2026-11-09 ~00:11 - GUI UP on native-adt; touch was probe-only <<<
+
+1. **User:** "è PARTITO" on `shim-boot-0096-native-adt.img` but touch dead.
+2. **Cause:** `davinci_touch_probeonly` defaults to **1** → log line
+   `DAVINCI TOUCH: probe-only completed; events disabled`. GT9886 probes OK
+   (pid 9886) but never polls. Working cmdline needs `davinci_touch_probeonly=0`.
+3. **Fix image booted** ~00:12 local: `shim/out/shim-boot-0096-touch.img`
+   (native+matched ADT + noconsole + **`davinci_touch_probeonly=0`**)
+   fastboot OKAY. Touch thread starts after **45 s** — look for
+   `DAVINCI TOUCH: 1080x2340 touch polling enabled`.
+
+---
+### >>> UPDATE 2026-11-09 ~00:07 - native black = ADT canvas mismatch <<<
+
+1. **User:** again black / "log nero" on native boot. Log
+   `logs/boot-0096-native-quiet-black.txt`: no Hakios, SB no crash, but
+   only 2 swaps/4 crop-copies — frozen black at `presented as 1080x2340`.
+
+2. **Likely cause:** `sweetfb_native=1` makes AppleCLCD report 1080x2340
+   while ADT `/arm-io/disp0` canvas stayed **1125x2436**. IOMFB/CA disagree
+   → near-zero useful frames.
+
+3. **Fix:** `mkadt.py --native` sets canvas to panel 1080x2340. Image
+   `shim/out/shim-boot-0096-native-adt.img` (0096 + native + noconsole +
+   matching ADT). **Booted** 2026-11-09 ~00:09 local OKAY (0.393/0.137s).
+   Await user: should not be frozen black; Hakios still later.
+
+---
+### >>> UPDATE 2026-11-08 ~23:55 - user wants Hakios ON; 0096-native went black <<<
+
+1. **User:** gate-off is wrong direction — wants Hakios running. Also
+   `0096-native-quiet` showed **black screen** (no GUI). Phone not in
+   adb/fastboot at report time.
+
+2. **Honest constraint (docs/METAL-PORT.md):** publishing incomplete
+   `IOAcceleratorES` makes CA pick Metal and stall (~2 swaps/h on the 1h
+   0097-native-quiet log). HakiosMetal CA plugin exists
+   (`out-bundles/ca/HakiosMetal.bundle` + `tools/HakiosMetalCA.m`) but
+   needs (a) bundle on rootfs, (b) GPU rails/SQE (`sweetgpu=5`), (c) plugin
+   actually completing CA frames. SpringBoard AGX metallibs are still the
+   decade track; Hakios path is *our* Metal plugin + Adreno submit.
+
+3. **Plan (Hakios-forward, not disable):**
+   - Pull `logs/boot-0096-native-quiet-black.txt` from recovery.
+   - Deploy bundle: `python tools/deploy-metal-bundle.py` (OrangeFox HFS).
+   - Boot `shim/out/shim-boot-0097-hakios.img` = 0097-ci +
+     `sweetgpu=5 sweetfb_native=1 sweetfb_noconsole=1` (Hakios + GMU/SQE lab).
+   - Gate `sweet_gpu_mode()>=3` in `37e5c0e` / CI **42532517410** stays:
+     daily `sweetgpu=1` keeps SW compositor; Hakios lab uses `>=3`/`5`.
+   - Emergency visible (no Hakios): `shim-boot-0096-gui.img` (1125 logical,
+     noconsole, sweetgpu=1) — may BoundingPath-loop but not black.
+
+4. **Next after Hakios boot log:** memnoc-gfx stuck / SQE / whether
+   QuartzCore loads HakiosMetal; first clear/blit into IOSurface.
 
 ---
 ### >>> UPDATE 2026-11-08 ~21:52 - 0097-native-quiet (console was eating the panel) <<<
