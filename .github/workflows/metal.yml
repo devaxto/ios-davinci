@@ -51,6 +51,7 @@ jobs:
             -Ihakios-metal/include \
             -DHAKIOS_METAL_GPU \
             -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function \
+            -Wl,-undefined,dynamic_lookup \
             tools/HakiosMetalCA.m hakios-metal/out/ios/libhakios-metal.a -lc++ \
             -o out/bundle_ca/HakiosMetal.bundle/HakiosMetal
           cp tools/HakiosMetal.plist out/bundle_ca/HakiosMetal.bundle/Info.plist
@@ -68,6 +69,7 @@ jobs:
             -Ihakios-metal/include -Ihakios-metal/plugin \
             -DHAKIOS_METAL_GPU \
             -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function \
+            -Wl,-undefined,dynamic_lookup \
             hakios-metal/plugin/HakiosMetal.m hakios-metal/plugin/hakios_metallib.c hakios-metal/out/ios/libhakios-metal.a -lc++ \
             -o out/bundle_std/HakiosMetal.bundle/HakiosMetal
           cp tools/HakiosMetal.plist out/bundle_std/HakiosMetal.bundle/Info.plist
