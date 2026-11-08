@@ -1,7 +1,16 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-10-15, latest)
+## Agent handoff / active work (2026-11-08, latest)
 
+### >>> UPDATE 2026-11-08 - 0097 HakiosGPU IOKit driver + Adreno 618 IB1 dispatch <<<
+
+Ported HakiOS (oosexgang/hakios-metal) DRM GEM protocol & IB1 indirect buffer submit to Adreno 618:
+- 	ools/gpu-src/SweetAccelerator.cpp: Implements HakiosGPU and HakiosGPUUserClient matching sweet,gpu. Exposes kMsmGetParam (0x06010800), kMsmGemNew (contiguous physical pages), kMsmGemInfo, kMsmGemSubmit (IB1 submit), kHakiosSurface (IOSurface backing), kMsmWaitFence.
+- 	ools/gpu-src/sweet_gpu.c: Added sweet_gpu_submit_ib1(pa, dwords) emitting CP_INDIRECT_BUFFER (Type 7 opcode 0x3f) and flushing REG_A6XX_CP_RB_WPTR. Added sweet_gpu_is_fence_done.
+- xnu/patches/0097-davinci-gpu-hakios-accel.patch: Wires HakiosGPU into KernelConfigTables and sweet_gpu.c.
+- CI: Build triggered on gpu-bringup branch.
+
+---
 ### >>> UPDATE 2026-10-30 - 0096 performance: safe flip + fast crop-copy (read first) <<<
 
 User wants better performance. GPU still cannot paint SB. Path that can:

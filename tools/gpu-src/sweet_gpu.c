@@ -791,4 +791,33 @@ sweet_gpu_probe(void)
 		gpu_read_chip();
 	}
 }
+
+static uint32_t g_last_fence = 0;
+
+uint32_t
+sweet_gpu_submit_ib1(uint64_t pa, uint32_t dwords)
+{
+	if (!g_sqe_up || g_rb == NULL) {
+		return 0;
+	}
+	rb_emit(cp_type7(CP_INDIRECT_BUFFER, 3));
+	rb_emit((uint32_t)(pa & 0xffffffffu));
+	rb_emit((uint32_t)(pa >> 32));
+	rb_emit(dwords);
+	__asm__ volatile ("dmb osh" ::: "memory");
+	agpu_wr(REG_A6XX_CP_RB_WPTR, g_rb_wptr);
+	return ++g_last_fence;
+}
+
+bool
+sweet_gpu_is_fence_done(uint32_t fence)
+{
+	if (!g_sqe_up || g_rb == NULL) {
+		return true;
+	}
+	uint32_t rptr = agpu_rd(REG_A6XX_CP_RB_RPTR);
+	uint32_t wptr = agpu_rd(REG_A6XX_CP_RB_WPTR);
+	return rptr == wptr;
+}
+
 #endif /* ARM64_BOARD_CONFIG_SWEET */
