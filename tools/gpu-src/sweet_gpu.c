@@ -296,6 +296,12 @@ gpu_cbcr_enable(vm_offset_t base, uint32_t off, uint32_t extra, const char *name
 {
 	uint32_t v = gpu_rd(base, off);
 	gpu_wr(base, off, v | CBCR_ENABLE | extra);
+	/* On Qualcomm SM7150, memnoc-gfx and snoc-dvm are BRANCH_HALT_DELAY:
+	 * their halt bit clears when AXI master traffic starts, not immediately at enable. */
+	if (strcmp(name, "memnoc-gfx") == 0 || strcmp(name, "snoc-dvm") == 0) {
+		delay(50);
+		return true;
+	}
 	for (int i = 0; i < 1000; i++) {
 		v = gpu_rd(base, off);
 		if (!(v & CBCR_CLK_OFF)) {
