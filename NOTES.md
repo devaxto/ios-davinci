@@ -45,18 +45,48 @@
      CPU copy path (no-op when the plane was never moved), so a frame that
      cannot flip repoints the DPU at the splash buffer instead of painting
      invisible memory.
-5. **Next:** `gh workflow run xnu.yml --ref gpu-bringup`; **verify the artifact
-   before booting** - `strings xnu/out-0101/kernel.development.sweet | grep
-   'flip pool'` / `grep 'sizes %s'` must hit, otherwise the patches were
-   skipped again (the run would now be red). Then build
-   `shim-boot-0101-feel.img` with `sweetfb_flip=1 sweetfb_native=1
-   sweetfb_noconsole=1 sweetfb_cache=1 sweetdpu=1 davinci_touch_probeonly=0`.
-   Expect in the log: `SWEET SURF: flip pool 3 slots ...`, `SWEET DPU: plane
-   ... sizes w-low`, `SWEET SURF: flip slot 0/1 pa 0x...`, `SWEET FB: flip
-   surface 2 pa ... crop 22,48 stride 4608 panel 1080x2340` and `present N ...
-   (flips N)` with no `crop-copy` lines after the first frames. If the panel
-   still scrambles, boot `sweetfb_flip=0` and pull the `plane` line - it tells
-   us whether the fail was geometry, packing or latch.
+5. **CI + artifact DONE:** run **42634216583** (commit `79a0973`) **success**
+   with `Check patch hunk headers`, `Build` and `Fail on skipped patches` all
+   green - i.e. 0099/0100/0101 really applied this time. Artifact
+   `xnu/out-0101/kernel.development.sweet`, 17,317,080 B, SHA256
+   `2acef62baa92d72fead17340b96831d3da7a5c14d678dcaba77a319ae196266e`.
+   Verified in the binary: `SWEET SURF: flip pool %u slots of %u bytes (%u KB
+   wired) -> %s`, `SWEET SURF: flip slot %u pa 0x%llx size %u`, `SWEET DPU:
+   plane ... sizes are %s`, `... sizes %s` (flip-ready line), `SWEET FB: flip
+   surface %u pa 0x%llx crop %u,%u stride %u panel %ux%u`, and the symbols
+   `_sweet_surface_flip_pool`, `_sweet_display_flip_reset`, `g_flip_*`.
+   (0100 never got a binary check - `xnu/out-0100` is the same skipped-patch
+   build as 0099; `shim-boot-0100-feel.img` was **never booted**.)
+6. **Image READY, not yet booted:** `shim/out/shim-boot-0101-feel.img`
+   17,297,408 B, SHA256
+   `29f0094f36b9e67b91c303a7a8712b013f6cbaaf46b5955ba1cfdfe3cef6f38c`
+   (= shim `Image` + `payload-0101-feel.bin` + `dtb/davinci.dtb`; unpacked
+   ramdisk byte-matches the payload). ADT `shim/out/sweet-0101.adt` =
+   `mkadt.py --native` (differs from `sweet-0100.adt` only in
+   `/chosen/random-seed`). Cmdline is the 0100-feel one, unchanged:
+   `... rd=ufsroot0 ... sweetgpu=1 sweetfb_flip=1 sweetfb_native=1
+   sweetfb_noconsole=1 sweetfb_cache=1 sweetdpu=1 davinci_touch_probeonly=0
+   sweetfb_hz=60`.
+   Recipe: `mkadt.py shim/out/sweet-0101.adt --native` -> `mkpayload.py
+   xnu/out-0101/kernel.development.sweet shim/out/sweet-0101.adt
+   shim/out/payload-0101-feel.bin --cmdline "<the line above>"` ->
+   `make-boot.py shim/out/shim-boot-0101-feel.img --payload
+   shim/out/payload-0101-feel.bin --dtb dtb/davinci.dtb --readelf
+   llvm-objdump.exe` (PATH needs `C:\Program Files\LLVM\bin`). NB the
+   PowerShell tool guard rejects the long `mkpayload.py ... --cmdline` line
+   with a bogus "rmdir" error; feeding the string through a small python
+   caller works.
+7. **Next: boot it** (`fastboot boot shim-boot-0101-feel.img`, phone in
+   bootloader - user's call). Expect in the log:
+   `SWEET SURF: flip pool 0..2 pa 0x...` + `flip pool 3 slots ...`,
+   `SWEET DPU: plane src_size ... sizes are w-low`,
+   `SWEET SURF: flip slot 0/1/2 pa 0x...`,
+   `SWEET FB: flip surface N pa ... crop 22,48 stride 4608 panel 1080x2340`,
+   and `present N ... (flips N)` with no `crop-copy` after the first frames.
+   If it scrambles: boot `shim-boot-0096-touch.img` (`flip=0`) and pull the
+   `plane` line - it says whether the failure is geometry, packing or latch.
+   If it stutters on every other frame, look for `flip pool slot N ...
+   contiguous alloc failed` (pool smaller than CA's rotation).
 
 ---
 
