@@ -464,12 +464,18 @@ AppleCLCD::swap(const uint8_t *rec)
 }
 
 /*
- * Zero-copy present (safe): layer dest must already be the panel hole and the
- * surface stride should match what the ABL programmed. Changing YSTRIDE to a
- * 1125-wide CA stride (0095) scrambled scanout — do not repeat that.
+ * Zero-copy present: point the live SSPP at the CA surface and let the DPU
+ * fetch it. The bootloader's pipeline is kept (same format, same panel-sized
+ * source window, same mixers); only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY move,
+ * so a bad guess costs one frame instead of the panel - and sweet_display_*
+ * restores the splash buffer and disables the flip if the write does not
+ * latch.
  *
- * sweetfb_flip=2: experimental crop flip (ADDR only, keep ABL stride) when
- * surface bytesPerRow == panel rowbytes. Rare with iPhone X logical size.
+ * The window is exactly the one the CPU crop-copy below uses: a full panel
+ * rect, cropped out of a larger logical surface when CoreAnimation draws
+ * 1125x2436 for the 1080x2340 panel. That is what makes native and logical
+ * mode flip the same way, and it is why the surface pitch (4320/4352/4608)
+ * must be programmed as YSTRIDE instead of the ABL's 4320.
  */
 static bool
 sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
@@ -477,10 +483,10 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	uint32_t mask = get32(rec, 0x104);
 	uint32_t found = 0, id = 0;
 	int32_t sx, sy, ldx, ldy, lw, lh;
-	uint32_t crop_x, crop_y, flip_stride;
+	uint32_t crop_x, crop_y;
 	const uint8_t *a, *b;
 	SweetSurface *s;
-	uint64_t phys, scan;
+	uint64_t phys;
 	uintptr_t src;
 	static uint32_t flip_logged;
 
@@ -528,25 +534,21 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 
 	crop_x = 0;
 	crop_y = 0;
-	if (fb->fFlipMode >= 2 &&
-	    ldx == 0 && ldy == 0 &&
+	if (ldx == 0 && ldy == 0 &&
 	    lw == (int32_t)fb->fLogicalW && lh == (int32_t)fb->fLogicalH &&
 	    sx == 0 && sy == 0 &&
-	    s->bytesPerRow == fb->fRowBytes &&
 	    s->width >= fb->fOffX + (int32_t)fb->fWidth &&
 	    s->height >= fb->fOffY + (int32_t)fb->fHeight) {
-		/* Same stride as ABL: crop by ADDR only, do not retune YSTRIDE. */
+		/* Logical-size layer: the panel is its centered window. */
 		crop_x = (uint32_t)fb->fOffX;
 		crop_y = (uint32_t)fb->fOffY;
 	} else if (ldx == fb->fOffX && ldy == fb->fOffY &&
 	    lw == (int32_t)fb->fWidth && lh == (int32_t)fb->fHeight &&
-	    sx == 0 && sy == 0) {
-		crop_x = 0;
-		crop_y = 0;
-		if (s->width < fb->fWidth || s->height < fb->fHeight) {
-			s->release();
-			return false;
-		}
+	    s->width >= (uint32_t)sx + fb->fWidth &&
+	    s->height >= (uint32_t)sy + fb->fHeight) {
+		/* Dest is the panel itself; the record may still offset the source. */
+		crop_x = (uint32_t)sx;
+		crop_y = (uint32_t)sy;
 	} else {
 		s->release();
 		return false;
@@ -558,29 +560,20 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		s->release();
 		return false;
 	}
-	scan = phys + (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u;
-	if (scan > 0xffffffffull) {
+	if (s->bytesPerRow == 0 || s->bytesPerRow > 0xffffu) {
+		s->release();
+		return false;
+	}
+	if (s->memory == NULL ||
+	    (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
 		s->release();
 		return false;
 	}
 	sweet_fb_clean_rows(src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
 	    (uint64_t)crop_x * 4u, (size_t)fb->fWidth * 4u,
 	    (int32_t)fb->fHeight, s->bytesPerRow);
-	/*
-	 * Pitch must match the buffer we point SRC_ADDR at.
-	 * ABL splash is 1080*4=4320; CA IOSurfaces are usually 64-byte
-	 * aligned (4352). Programming YSTRIDE=4320 while scanning a 4352
-	 * surface scrambled the panel (pink line / white tiles). For an
-	 * exact panel-sized present use the surface pitch; for crop mode
-	 * (>=2) we already require bytesPerRow == panel rowbytes.
-	 */
-	flip_stride = (crop_x == 0 && crop_y == 0) ?
-	    s->bytesPerRow : fb->fRowBytes;
-	if (flip_stride == 0 || flip_stride > 0xffffu) {
-		s->release();
-		return false;
-	}
-	if (!sweet_display_flip((uint32_t)scan, flip_stride)) {
+	if (!sweet_display_flip((uint32_t)phys, s->bytesPerRow, crop_x, crop_y,
+	    fb->fWidth, fb->fHeight)) {
 		s->release();
 		return false;
 	}
@@ -589,9 +582,9 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	if (flip_logged < 8) {
 		flip_logged++;
 		IOLog("SWEET FB: flip surface %u pa 0x%llx crop %u,%u stride %u "
-		    "(surf bpr %u)\n",
-		    s->id, (unsigned long long)scan, crop_x, crop_y, flip_stride,
-		    s->bytesPerRow);
+		    "panel %ux%u\n",
+		    s->id, (unsigned long long)phys, crop_x, crop_y,
+		    s->bytesPerRow, fb->fWidth, fb->fHeight);
 	}
 	s->release();
 	return true;

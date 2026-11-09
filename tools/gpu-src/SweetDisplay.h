@@ -4,9 +4,9 @@
  * The bootloader leaves the display controller scanning the panel
  * framebuffer. sweet_display_probe() reads the live pipeline (never writes
  * unless sweetfb_flip is later used) and remembers the SSPP SRC_ADDR /
- * YSTRIDE and CTL flush bit. sweet_display_flip() then points that layer at
- * a new physically contiguous buffer - a present with no 10 MB CPU copy.
- * See docs/GPU.md.
+ * YSTRIDE / SRC_XY / SRC_SIZE and the live CTLs. sweet_display_flip() then
+ * points that layer at a new physically contiguous buffer - a present with
+ * no 10 MB CPU copy. See docs/GPU.md.
  */
 #ifndef _SWEET_DISPLAY_H_
 #define _SWEET_DISPLAY_H_
@@ -31,12 +31,18 @@ bool sweet_display_can_flip(void);
 
 /*
  * Point the live SSPP at phys (32-bit PA) with the given bytes-per-row and
- * flush the CTL so the next scanout picks it up. Returns false if the probe
- * did not find a layer or the DPU mapping is gone. Does not touch format /
- * SRC_SIZE / mixer - those stay as the bootloader left them, so phys must
- * be a same-format buffer the DPU can read (SMMU bypassed for splash).
+ * source window. (x, y) is the origin of the panel-sized window inside the
+ * buffer (0,0 for an exact panel surface; the centered crop for a larger
+ * logical surface), width/height default to the panel rect when 0.
+ *
+ * Only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY are written (SRC_SIZE/DST_SIZE only
+ * when the window differs from the bootloader's), then every live CTL is
+ * flushed and kicked. Returns false if the probe did not find a layer, the
+ * DPU mapping is gone, the size encoding could not be derived for a window
+ * change, or the write did not latch (the plane is restored first).
  */
-bool sweet_display_flip(uint32_t phys, uint32_t stride);
+bool sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
+    uint32_t width, uint32_t height);
 
 /* Restore the original ABL splash PA (for power-off fade / panic path). */
 void sweet_display_flip_reset(void);

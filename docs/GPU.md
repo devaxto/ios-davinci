@@ -104,23 +104,34 @@ Nothing is written, no clock or GDSC is touched; if the SDE reads back
 0/0xffffffff the dump stops instead of hammering a gated block. Read the
 log for `SWEET DPU:` lines after a boot.
 
-### 0088 — the flip (sweetfb_flip=1, opt-in)
+### 0088/0100 — the flip (`sweetfb_flip=1`, on by default)
 
-One present becomes: clean the surface (dc cvac over the written rect,
-the DPU is not cache coherent) + rewrite SRC_ADDR (and the low 16 bits of
-YSTRIDE0 when the stride differs) + CTL_FLUSH (and CTL_START if the
-probe saw no live INTF/PP counters). Implemented in
-SweetDisplay.cpp + AppleCLCD::present(); IOSurface create prefers
-kIOMemoryPhysicallyContiguous below 4 GB so layers have a PA the DPU can
-read. Preconditions checked at runtime:
+One present becomes: clean the surface (dc cvac over the written rect, the
+DPU is not cache coherent) + point the live SSPP at it. The bootloader's
+pipeline is kept - same format, same mixers, same panel-sized source
+window - only three registers move:
 
-- the probe found an SSPP holding the panel PA (SWEET DPU: flip ready on …);
-- exactly one enabled full-screen BGRA layer, dest rect = panel, src at 0,0;
-- that surface's sweet_surface_phys() is nonzero and <= 4 GB;
-- anything else (multi-layer, partial rect, non-contiguous) keeps the CPU
-  copy. A wrong flip can blank the panel until reboot, so the default is
-  off (sweetfb_flip=0); boot with sweetfb_flip=1 after 0087's probe log
-  has confirmed the live layer.
+- `SRC_ADDR` = surface PA and `YSTRIDE0` = the *surface* pitch (CA surfaces
+  are 64-byte aligned: 4352 for 1080 wide, 4608 for 1125), never the ABL's
+  4320 - a mismatched pitch is what scrambled 0095 and 0098;
+- `SRC_XY` = the panel crop inside the surface: 0,0 on a native present,
+  `fOffX,fOffY` (22,48) when CA draws 1125x2436 for the 1080x2340 panel,
+  i.e. exactly the window the CPU crop-copy moves;
+- `SRC_SIZE`/`DST_SIZE` change only when the window does, and only with the
+  size-vs-size-1 encoding the probe derived from the live `DST_SIZE`; an
+  undecodable encoding keeps the bootloader geometry and refuses crops.
+
+Flush (`CTL_FLUSH`, SSPP bit) + `CTL_START` go to every CTL that has a live
+`CTL_LAYER`, so the kick lands whichever control path drives DSI0. The
+`SRC_ADDR` write is read back: if it did not latch the plane is restored and
+the flip disabled for the boot, so the CPU copy keeps the screen alive
+instead of leaving a scramble on the panel.
+
+Preconditions checked at runtime: exactly one enabled full-screen BGRA layer
+whose dest is the panel (or the whole logical size), `sweet_surface_phys()`
+nonzero and below 4 GB (splash slot or contiguous DRAM). Anything else
+(multi-layer, partial rect, non-contiguous) keeps the CPU copy. A wrong flip
+can still tear; it can no longer strand the panel.
 
 ### After the flip: hardware layers
 
