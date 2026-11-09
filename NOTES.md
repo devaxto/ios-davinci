@@ -76,16 +76,23 @@
    PowerShell tool guard rejects the long `mkpayload.py ... --cmdline` line
    with a bogus "rmdir" error; feeding the string through a small python
    caller works.
-7. **Next: boot it** (`fastboot boot shim-boot-0101-feel.img`, phone in
-   bootloader - user's call). Expect in the log:
+7. **BOOTED 2026-11-09 16:16 local** (user put davinci `aa20029b`/product
+   `davinci` in fastboot, approved "fai tu"):
+   `fastboot boot shim/out/shim-boot-0101-feel.img` -> Sending 'boot.img'
+   (16892 KB) OKAY 0.395s, Booting OKAY 0.136s, total 0.541s; device left
+   fastboot immediately. **Awaiting the panel**: this is the first boot with
+   0099+0100+0101 actually in the kernel, so it is also the first test of the
+   SRC_XY crop flip and of the 3-slot flip pool. Expect in the log:
    `SWEET SURF: flip pool 0..2 pa 0x...` + `flip pool 3 slots ...`,
    `SWEET DPU: plane src_size ... sizes are w-low`,
    `SWEET SURF: flip slot 0/1/2 pa 0x...`,
    `SWEET FB: flip surface N pa ... crop 22,48 stride 4608 panel 1080x2340`,
    and `present N ... (flips N)` with no `crop-copy` after the first frames.
-   If it scrambles: boot `shim-boot-0096-touch.img` (`flip=0`) and pull the
-   `plane` line - it says whether the failure is geometry, packing or latch.
-   If it stutters on every other frame, look for `flip pool slot N ...
+   Next action: `python tools/sweet-log-pull.py logs/boot-0101-feel.txt` from
+   OrangeFox (adb), then read the flip/pool/plane lines. If it scrambles: boot
+   `shim-boot-0096-touch.img` (`flip=0`) and pull the same log - the `plane`
+   line says whether the failure is geometry, packing or latch. If it stutters
+   on every other frame, look for `flip pool slot N ...
    contiguous alloc failed` (pool smaller than CA's rotation).
 
 ---
