@@ -9,10 +9,16 @@
  * sweet_display_flip) rewrites SRC_ADDR so a present is two MMIO writes
  * instead of a 10 MB memcpy. See docs/GPU.md.
  *
- * Register offsets below are the davinci DTB values relative to mdp_phys
- * 0xae00000. SSPP_SRC0_ADDR = +0x14, SSPP_SRC_YSTRIDE0 = +0x24, CTL_FLUSH =
- * +0x018, CTL_START = +0x01C (Linux dpu_hw_sspp / dpu_hw_ctl). Flush bits
- * match SDE: VIG0/1 = 0/1, DMA0/1/2 = 11/12/24, LM0 = 6.
+ * Register offsets are the davinci DTB values relative to mdp_phys
+ * 0xae00000, with the SSPP rect offsets from the CAF SDE driver for this SoC
+ * (drivers/gpu/drm/msm/sde/sde_hw_sspp.c, SRC sub-block base 0):
+ * SRC_SIZE +0x00, SRC_XY +0x08, OUT_SIZE +0x0c, OUT_XY +0x10, SRC0_ADDR
+ * +0x14, SRC_YSTRIDE0 +0x24, SRC_FORMAT +0x30. Sizes pack (h << 16) | w and
+ * positions (y << 16) | x. 0101 read SRC_FORMAT as SRC_SIZE and
+ * UNPACK_PATTERN as OUT_SIZE, so the live window never decoded and was never
+ * programmed - the panel kept the bootloader's scaling. CTL_FLUSH = +0x018,
+ * CTL_START = +0x01C (Linux dpu_hw_ctl). Flush bits match SDE:
+ * VIG0/1 = 0/1, DMA0/1/2 = 11/12/24, LM0 = 6.
  */
 #include "SweetDisplay.h"
 
@@ -34,24 +40,27 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 #define DSI0_PA             0x0ae94000u
 #define DSI0_SIZE           0x00001000u
 
+#define SSPP_SRC_SIZE       0x000u
+#define SSPP_SRC_XY         0x008u
+#define SSPP_OUT_SIZE       0x00Cu
+#define SSPP_OUT_XY         0x010u
 #define SSPP_SRC0_ADDR      0x014u
 #define SSPP_SRC_YSTRIDE0   0x024u
-#define SSPP_SRC_XY         0x028u
-#define SSPP_DST_XY         0x02Cu
-#define SSPP_SRC_SIZE       0x030u
-#define SSPP_DST_SIZE       0x034u
-#define SSPP_SRC_FORMAT     0x038u
+#define SSPP_SRC_FORMAT     0x030u
+#define SSPP_SRC_UNPACK     0x034u
+#define SSPP_SRC_OP_MODE    0x038u
+#define SSPP_MULTIRECT_MODE 0x170u
 #define CTL_FLUSH           0x018u
 #define CTL_START           0x01Cu
 #define CTL_LAYER           0x000u
 
 /*
- * SRC_SIZE / DST_SIZE / SRC_XY pack two 16-bit fields with one macro, but the
- * SDE revisions disagree on the order (width in the low or the high half) and
- * on whether the fields hold size or size-1. Do not trust either: decode the
- * live DST_SIZE, which must be the panel rect because the CPU copy into the
- * panel shows 1:1, and keep the candidate that reproduces it. SRC_XY uses the
- * same order. Geometry that cannot be decoded is never written.
+ * The vendor packing is (h << 16) | w for sizes and (y << 16) | x for
+ * positions, but a bootloader may hold size-1 or the halves swapped, so the
+ * probe decodes the live OUT_SIZE against the panel rect over four candidates
+ * and keeps the one that reproduces it. Nothing decodes -> the vendor packing
+ * is used: the window has to be programmed either way, because leaving one we
+ * cannot read is what kept the DPU scaling the bootloader's splash rectangle.
  */
 static const struct {
 	int minus1;
@@ -104,22 +113,25 @@ struct sweet_dpu_state {
 	uint32_t    src_stride_off;
 	uint32_t    src_xy_off;     /* absolute from mdss base */
 	uint32_t    src_size_off;
-	uint32_t    dst_xy_off;
-	uint32_t    dst_size_off;
+	uint32_t    out_xy_off;
+	uint32_t    out_size_off;
 	uint32_t    ctl_off;
 	uint32_t    ctl_bits;       /* bit i = ctl i carries a live LAYER */
 	uint32_t    flush_mask;
 	uint32_t    orig_pa;
 	uint32_t    orig_stride;
 	uint32_t    orig_src_size;
-	uint32_t    orig_dst_size;
+	uint32_t    orig_out_size;
 	uint32_t    orig_src_xy;
 	uint32_t    cur_pa;
 	uint32_t    cur_stride;
 	uint32_t    cur_src_size;
 	uint32_t    cur_x, cur_y;    /* source window origin */
 	uint32_t    cur_w, cur_h;    /* source window size (= panel) */
+	uint32_t    flips_logged;
 	int         size_enc;       /* index into kSizeEnc, 0 = unknown */
+	int         geom_guess;     /* size packing could not be decoded */
+	int         geom_write;     /* sweetfb_geom, default on */
 	int         dirty;          /* plane moved off the bootloader state */
 	int         video_mode;     /* INTF/PP counters moved */
 	int         ready;
@@ -244,8 +256,8 @@ dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
 				g_dpu.src_stride_off = b->off + SSPP_SRC_YSTRIDE0;
 				g_dpu.src_xy_off = b->off + SSPP_SRC_XY;
 				g_dpu.src_size_off = b->off + SSPP_SRC_SIZE;
-				g_dpu.dst_xy_off = b->off + SSPP_DST_XY;
-				g_dpu.dst_size_off = b->off + SSPP_DST_SIZE;
+				g_dpu.out_xy_off = b->off + SSPP_OUT_XY;
+				g_dpu.out_size_off = b->off + SSPP_OUT_SIZE;
 				g_dpu.flush_mask = b->flush;
 				g_dpu.orig_pa = fb_pa;
 				g_dpu.cur_pa = fb_pa;
@@ -386,59 +398,69 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 	dpu_pick_ctls(mdss);
 
 	/*
-	 * Geometry the bootloader left live. The CPU copy paints the whole panel
-	 * 1:1 out of this very pipeline, so DST_SIZE must be the panel rect and
-	 * SRC_SIZE the same: that is what makes a repoint safe. Decode the
-	 * size-1 vs size encoding from DST_SIZE; if it matches neither, leave
-	 * SRC_SIZE/DST_SIZE alone and only allow same-geometry flips.
+	 * Geometry the bootloader left live, read from where the SDE actually
+	 * keeps it: SRC_SIZE/SRC_XY for the source rect, OUT_SIZE/OUT_XY for the
+	 * mixer rect. The vendor packing is (h << 16) | w; the four candidates
+	 * only exist so a bootloader that wrote size-1 or swapped halves is
+	 * understood. Whatever it is, the flip programs the window again: the
+	 * panel never showed the surface correctly while the bootloader's
+	 * rectangle was left in place.
 	 */
 	if (g_dpu.ready) {
-		uint32_t src, dst, src_xy, dst_xy, fmt, dw, dh, sw, sh;
+		uint32_t src, out, src_xy, out_xy, fmt, unpack, opmode, multi;
+		uint32_t dw = 0, dh = 0, sw = 0, sh = 0;
+		int enc = SWEET_SIZE_UNKNOWN;
+		int geom = 1;
 
 		src = dpu_rd(mdss, g_dpu.src_size_off);
-		dst = dpu_rd(mdss, g_dpu.dst_size_off);
+		out = dpu_rd(mdss, g_dpu.out_size_off);
 		src_xy = dpu_rd(mdss, g_dpu.src_xy_off);
-		dst_xy = dpu_rd(mdss, g_dpu.dst_xy_off);
+		out_xy = dpu_rd(mdss, g_dpu.out_xy_off);
 		fmt = dpu_rd(mdss, g_dpu.sspp_off + SSPP_SRC_FORMAT);
+		unpack = dpu_rd(mdss, g_dpu.sspp_off + SSPP_SRC_UNPACK);
+		opmode = dpu_rd(mdss, g_dpu.sspp_off + SSPP_SRC_OP_MODE);
+		multi = dpu_rd(mdss, g_dpu.sspp_off + SSPP_MULTIRECT_MODE);
 		g_dpu.orig_src_size = src;
-		g_dpu.orig_dst_size = dst;
+		g_dpu.orig_out_size = out;
 		g_dpu.orig_src_xy = src_xy;
+		PE_parse_boot_argn("sweetfb_geom", &geom, sizeof(geom));
+		g_dpu.geom_write = geom > 0;
+
 		for (int e = 1; e <= (int)SWEET_SIZE_ENCS; e++) {
-			dpu_size_decode(dst, e, &dw, &dh);
+			dpu_size_decode(out, e, &dw, &dh);
 			if (dw == fb_width && dh == fb_height) {
-				g_dpu.size_enc = e;
+				enc = e;
 				break;
 			}
 		}
-		dpu_size_decode(src, g_dpu.size_enc, &sw, &sh);
-		dpu_size_decode(dst, g_dpu.size_enc, &dw, &dh);
-		/*
-		 * A decoded origin means the bootloader already cropped the
-		 * source; anything else is the full buffer, so treat the window
-		 * size as the panel and the origin as 0 when the packing is
-		 * unknown (an ADDR-only flip is still safe then).
-		 */
-		if (g_dpu.size_enc != SWEET_SIZE_UNKNOWN) {
-			dpu_size_decode(src_xy, g_dpu.size_enc, &g_dpu.cur_x, &g_dpu.cur_y);
-			g_dpu.cur_w = dw;
-			g_dpu.cur_h = dh;
-		} else {
-			g_dpu.cur_x = 0;
-			g_dpu.cur_y = 0;
-			g_dpu.cur_w = fb_width;
-			g_dpu.cur_h = fb_height;
+		if (enc == SWEET_SIZE_UNKNOWN) {
+			/* kSizeEnc[0] is the vendor packing: (h << 16) | w. */
+			enc = 1;
+			g_dpu.geom_guess = 1;
 		}
-		if (g_dpu.size_enc != SWEET_SIZE_UNKNOWN &&
-		    (g_dpu.cur_x + g_dpu.cur_w > sw || g_dpu.cur_y + g_dpu.cur_h > sh)) {
-			/* Decode does not add up: leave the geometry alone. */
-			g_dpu.size_enc = SWEET_SIZE_UNKNOWN;
-			g_dpu.cur_x = 0;
-			g_dpu.cur_y = 0;
+		g_dpu.size_enc = enc;
+		dpu_size_decode(src, enc, &sw, &sh);
+		dpu_size_decode(out, enc, &dw, &dh);
+		dpu_size_decode(src_xy, enc, &g_dpu.cur_x, &g_dpu.cur_y);
+		/* What the plane really holds, so the flip knows what to fix. */
+		g_dpu.cur_w = dw;
+		g_dpu.cur_h = dh;
+		IOLog("SWEET DPU: plane src_size 0x%08x out_size 0x%08x src_xy "
+		    "0x%08x out_xy 0x%08x fmt 0x%08x unpack 0x%08x opmode 0x%08x "
+		    "multi 0x%08x -> src %ux%u out %ux%u at %u,%u sizes %s%s\n",
+		    src, out, src_xy, out_xy, fmt, unpack, opmode, multi,
+		    sw, sh, dw, dh, g_dpu.cur_x, g_dpu.cur_y, dpu_enc_name(),
+		    g_dpu.geom_guess ? " (guess)" : "");
+		if (multi != 0) {
+			/* Virtual planes: rect1 has its own address/size block. */
+			IOLog("SWEET DPU: SSPP is in multirect mode, flip keeps rect0 "
+			    "only\n");
 		}
-		IOLog("SWEET DPU: plane src_size 0x%08x dst_size 0x%08x src_xy "
-		    "0x%08x dst_xy 0x%08x fmt 0x%08x -> src %ux%u dst %ux%u "
-		    "sizes are %s\n",
-		    src, dst, src_xy, dst_xy, fmt, sw, sh, dw, dh, dpu_enc_name());
+		if (dw != fb_width || dh != fb_height) {
+			IOLog("SWEET DPU: bootloader window is %ux%u, the flip will "
+			    "program %ux%u%s\n", dw, dh, fb_width, fb_height,
+			    g_dpu.geom_write ? "" : " (sweetfb_geom=0)");
+		}
 	}
 
 	dsi = ml_io_map(DSI0_PA, DSI0_SIZE);
@@ -461,13 +483,14 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 
 	if (g_dpu.ready) {
 		IOLog("SWEET DPU: flip ready on %s SRC_ADDR=+0x%x YSTRIDE=+0x%x "
-		    "SZ=+0x%x CTL0x%x flush=0x%x %s%s%s sizes %s\n",
+		    "SRC_SIZE=+0x%x OUT_SIZE=+0x%x CTL0x%x flush=0x%x %s%s%s "
+		    "sizes %s\n",
 		    g_dpu.sspp_name ? g_dpu.sspp_name : "?",
 		    g_dpu.src_addr_off, g_dpu.src_stride_off, g_dpu.src_size_off,
-		    g_dpu.ctl_bits, g_dpu.flush_mask,
+		    g_dpu.out_size_off, g_dpu.ctl_bits, g_dpu.flush_mask,
 		    g_dpu.video_mode ? "video" : "cmd-or-idle",
-		    g_dpu.size_enc == SWEET_SIZE_UNKNOWN ? " geom-locked" : "",
-		    g_dpu.orig_src_xy != 0 ? " src-xy-nonzero" : "",
+		    g_dpu.geom_guess ? " geom-guess" : "",
+		    g_dpu.geom_write ? "" : " geom-read-only",
 		    dpu_enc_name());
 	} else {
 		IOLog("SWEET DPU: no SSPP holds the panel PA - flip disabled\n");
@@ -489,7 +512,7 @@ dpu_restore(void)
 		return;
 	}
 	dpu_wr(g_dpu.mdss, g_dpu.src_size_off, g_dpu.orig_src_size);
-	dpu_wr(g_dpu.mdss, g_dpu.dst_size_off, g_dpu.orig_dst_size);
+	dpu_wr(g_dpu.mdss, g_dpu.out_size_off, g_dpu.orig_out_size);
 	dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, g_dpu.orig_src_xy);
 	dpu_wr(g_dpu.mdss, g_dpu.src_stride_off,
 	    (dpu_rd(g_dpu.mdss, g_dpu.src_stride_off) & 0xffff0000u) |
@@ -501,13 +524,10 @@ dpu_restore(void)
 	g_dpu.cur_src_size = g_dpu.orig_src_size;
 	/* The origin the bootloader left, not 0: a later crop flip only writes
 	 * SRC_XY when it differs from this. */
-	if (g_dpu.size_enc != SWEET_SIZE_UNKNOWN) {
-		dpu_size_decode(g_dpu.orig_src_xy, g_dpu.size_enc, &g_dpu.cur_x,
-		    &g_dpu.cur_y);
-	} else {
-		g_dpu.cur_x = 0;
-		g_dpu.cur_y = 0;
-	}
+	dpu_size_decode(g_dpu.orig_src_xy, g_dpu.size_enc, &g_dpu.cur_x,
+	    &g_dpu.cur_y);
+	dpu_size_decode(g_dpu.orig_out_size, g_dpu.size_enc, &g_dpu.cur_w,
+	    &g_dpu.cur_h);
 	g_dpu.dirty = 0;
 }
 
@@ -515,65 +535,90 @@ dpu_restore(void)
  * Point the live SSPP at phys (32-bit PA) with the given bytes-per-row and a
  * source window (origin inside that buffer, size in pixels).
  *
- * SRC_ADDR / YSTRIDE0 always move. SRC_SIZE/DST_SIZE only when the window
- * size differs from what the bootloader programmed - the panel-sized flip
- * leaves the mixer and any scaler exactly as they were, which is why it
- * cannot scramble (a wrongly packed SRC_SIZE is what did). SRC_XY only when
- * the origin differs from the bootloader's. A window that needs geometry the
- * probe could not decode is refused, never guessed.
+ * The window is programmed, not inherited: SRC_SIZE and OUT_SIZE both get
+ * (h << 16) | w in the packing the probe decoded, SRC_XY gets the crop origin.
+ * Leaving the bootloader's rectangle in place is what made 0101 scan the
+ * surface through its scaling (white background, blocky icons). YSTRIDE0 takes
+ * the surface pitch and SRC_ADDR the surface PA; OUT_XY stays where the
+ * bootloader put the panel rect (0,0).
+ *
+ * SRC_ADDR is read back, and so is OUT_SIZE when it was written: a write that
+ * did not land restores the splash plane and disables the flip for this boot,
+ * so the CPU copy keeps the screen.
  */
 bool
 sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
     uint32_t width, uint32_t height)
 {
-	uint32_t ystride, size, latched;
+	uint32_t size, xy, ystride, latched, out;
+	bool wrote_size = false;
 
 	if (!sweet_display_can_flip() || phys == 0 || width == 0 || height == 0) {
 		return false;
 	}
-	if (phys == g_dpu.cur_pa && stride == g_dpu.cur_stride &&
-	    x == g_dpu.cur_x && y == g_dpu.cur_y &&
-	    width == g_dpu.cur_w && height == g_dpu.cur_h) {
+	if (g_dpu.cur_pa == phys && g_dpu.dirty &&
+	    g_dpu.cur_stride == stride && g_dpu.cur_x == x && g_dpu.cur_y == y &&
+	    g_dpu.cur_w == width && g_dpu.cur_h == height) {
 		return true;
 	}
-	if (width != g_dpu.cur_w || height != g_dpu.cur_h) {
-		if (g_dpu.size_enc == SWEET_SIZE_UNKNOWN) {
-			return false;
-		}
+	if (g_dpu.geom_write) {
 		size = dpu_size_pack(width, height, g_dpu.size_enc);
-		dpu_wr(g_dpu.mdss, g_dpu.src_size_off, size);
-		dpu_wr(g_dpu.mdss, g_dpu.dst_size_off, size);
-		g_dpu.cur_src_size = size;
-		g_dpu.cur_w = width;
-		g_dpu.cur_h = height;
-		g_dpu.dirty = 1;
-	}
-	if (x != g_dpu.cur_x || y != g_dpu.cur_y) {
-		if (g_dpu.size_enc == SWEET_SIZE_UNKNOWN) {
+		if (size == 0) {
 			return false;
 		}
-		dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, dpu_xy_pack(x, y, g_dpu.size_enc));
+		if (dpu_rd(g_dpu.mdss, g_dpu.src_size_off) != size) {
+			dpu_wr(g_dpu.mdss, g_dpu.src_size_off, size);
+			wrote_size = true;
+		}
+		if (dpu_rd(g_dpu.mdss, g_dpu.out_size_off) != size) {
+			dpu_wr(g_dpu.mdss, g_dpu.out_size_off, size);
+			wrote_size = true;
+		}
+		xy = dpu_xy_pack(x, y, g_dpu.size_enc);
+		if (dpu_rd(g_dpu.mdss, g_dpu.src_xy_off) != xy) {
+			dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, xy);
+		}
+		g_dpu.cur_src_size = size;
 		g_dpu.cur_x = x;
 		g_dpu.cur_y = y;
-		g_dpu.dirty = 1;
+		g_dpu.cur_w = width;
+		g_dpu.cur_h = height;
+	}
+	if (stride != 0) {
+		ystride = dpu_rd(g_dpu.mdss, g_dpu.src_stride_off);
+		if ((ystride & 0xffffu) != (stride & 0xffffu)) {
+			dpu_wr(g_dpu.mdss, g_dpu.src_stride_off,
+			    (ystride & 0xffff0000u) | (stride & 0xffffu));
+		}
+		g_dpu.cur_stride = stride;
 	}
 	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, phys);
-	if (stride != 0 && stride != g_dpu.cur_stride) {
-		ystride = dpu_rd(g_dpu.mdss, g_dpu.src_stride_off);
-		ystride = (ystride & 0xffff0000u) | (stride & 0xffffu);
-		dpu_wr(g_dpu.mdss, g_dpu.src_stride_off, ystride);
-		g_dpu.cur_stride = stride;
-		g_dpu.dirty = 1;
-	}
 	dpu_commit();
 
 	latched = dpu_rd(g_dpu.mdss, g_dpu.src_addr_off);
-	if (latched != phys) {
-		IOLog("SWEET DPU: flip did not stick (0x%08x != 0x%08x), "
-		    "restoring and disabling\n", latched, phys);
+	out = dpu_rd(g_dpu.mdss, g_dpu.out_size_off);
+	if (latched != phys || (wrote_size &&
+	    out != dpu_size_pack(width, height, g_dpu.size_enc))) {
+		IOLog("SWEET DPU: flip did not stick (addr 0x%08x/0x%08x out "
+		    "0x%08x), restoring and disabling\n", latched, phys, out);
 		dpu_restore();
 		g_dpu.disabled = 1;
 		return false;
+	}
+	/*
+	 * The first flips log the whole plane so a wrong picture can be read back
+	 * from the log instead of guessed at.
+	 */
+	if (g_dpu.flips_logged < 8) {
+		g_dpu.flips_logged++;
+		IOLog("SWEET DPU: flip %u pa 0x%08x stride %u win %ux%u at %u,%u -> "
+		    "SRC_SIZE 0x%08x OUT_SIZE 0x%08x SRC_XY 0x%08x OUT_XY 0x%08x "
+		    "YSTRIDE 0x%08x%s\n", g_dpu.flips_logged, phys, stride, width,
+		    height, x, y, dpu_rd(g_dpu.mdss, g_dpu.src_size_off), out,
+		    dpu_rd(g_dpu.mdss, g_dpu.src_xy_off),
+		    dpu_rd(g_dpu.mdss, g_dpu.out_xy_off),
+		    dpu_rd(g_dpu.mdss, g_dpu.src_stride_off),
+		    wrote_size ? " (window programmed)" : "");
 	}
 	g_dpu.cur_pa = phys;
 	g_dpu.dirty = 1;

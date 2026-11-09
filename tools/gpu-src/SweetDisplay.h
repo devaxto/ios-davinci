@@ -35,13 +35,13 @@ bool sweet_display_can_flip(void);
  * buffer (0,0 for an exact panel surface; the centered crop for a larger
  * logical surface), width/height default to the panel rect when 0.
  *
- * Only SRC_ADDR and SRC_YSTRIDE0 are written for a panel-sized flip;
- * SRC_SIZE/DST_SIZE change only when the window size differs from the
- * bootloader's and SRC_XY only when the origin does, so the mixer, format and
- * any scaler stay untouched. Every live CTL is then flushed and kicked.
- * Returns false if the probe did not find a layer, the DPU mapping is gone, the
- * size encoding could not be derived for a window change, or the write did not
- * latch (the plane is restored first).
+ * The window is programmed, not inherited: SRC_SIZE and OUT_SIZE get the
+ * panel rect (each only when the register differs) and SRC_XY the crop origin,
+ * from the CAF SSPP offsets used by the probe. Format, unpack pattern and the
+ * mixer are left alone. SRC_ADDR is always written; every live CTL is then
+ * flushed and kicked, and SRC_ADDR/OUT_SIZE are read back.
+ * Returns false if the probe did not find a layer, the DPU mapping is gone, or
+ * the write did not latch (the plane is restored and the flip disabled).
  */
 bool sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
     uint32_t width, uint32_t height);

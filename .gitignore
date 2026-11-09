@@ -10,4 +10,6 @@ research/
 shim/out/
 xnu/out/
 xnu/out-*/
+# scratch tree verify-patch-chain.py rebuilds on every run
+tools/gpu-src/_chain/
 __pycache__/

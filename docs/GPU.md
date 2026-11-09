@@ -104,31 +104,41 @@ Nothing is written, no clock or GDSC is touched; if the SDE reads back
 0/0xffffffff the dump stops instead of hammering a gated block. Read the
 log for `SWEET DPU:` lines after a boot.
 
-### 0088/0100/0101 — the flip (`sweetfb_flip=1`, on by default)
+### 0088/0100/0101/0102 — the flip (`sweetfb_flip=1`, on by default)
 
 One present becomes: clean the surface (dc cvac over the written rect, the
 DPU is not cache coherent) + point the live SSPP at it. The bootloader's
-pipeline is kept - same format, same mixers, same panel-sized source
-window - only three registers move:
+pipeline is kept - same format word, same unpack pattern, same mixers - and
+the registers that move are the SSPP source rectangle and address:
 
-- `SRC_ADDR` = surface PA and `YSTRIDE0` = the *surface* pitch (CA surfaces
-  are 64-byte aligned: 4352 for 1080 wide, 4608 for 1125), never the ABL's
-  4320 - a mismatched pitch is what scrambled 0095 and 0098;
-- `SRC_XY` = the panel crop inside the surface: 0,0 on a native present,
-  `fOffX,fOffY` (22,48) when CA draws 1125x2436 for the 1080x2340 panel,
-  i.e. exactly the window the CPU crop-copy moves - and only when it differs
-  from what the bootloader left;
-- `SRC_SIZE`/`DST_SIZE` change only when the window *size* does, and only
-  with the packing the probe decoded from the live `DST_SIZE` out of four
-  candidates (width in the low or high half, size or size-1). A panel-sized
-  flip therefore leaves the mixer, format and any scaler untouched; an
-  undecodable packing keeps the bootloader geometry and refuses crops.
+- `SRC_ADDR` (+0x14) = surface PA and `YSTRIDE0` (+0x24) = the *surface*
+  pitch (CA surfaces are 64-byte aligned: 4352 for 1080 wide, 4608 for 1125),
+  never the ABL's 4320 - a mismatched pitch is what scrambled 0095 and 0098;
+- `SRC_XY` (+0x08) = the panel crop inside the surface: 0,0 on a native
+  present, `fOffX,fOffY` (22,48) when CA draws 1125x2436 for the 1080x2340
+  panel, i.e. exactly the window the CPU crop-copy moves;
+- `SRC_SIZE` (+0x00) and `OUT_SIZE` (+0x0c) = the panel rect, written whenever
+  the register differs from it. 0101 left this to the bootloader and the panel
+  kept its scaling (white background, blocky content): the probe was reading
+  `SRC_FORMAT` as `SRC_SIZE`, because the offsets were the `SRC_SIZE = 0x30`
+  layout of an older SDE revision (log: `plane src_size 0x000237ff ... sizes
+  are unknown` - that word is a 32bpp RGBA format, not a size).
+
+0102 uses the CAF map for this SoC (`drivers/gpu/drm/msm/sde/sde_hw_sspp.c`,
+SRC sub-block base 0): `SRC_SIZE +0x00`, `SRC_XY +0x08`, `OUT_SIZE +0x0c`,
+`OUT_XY +0x10`, `SRC0_ADDR +0x14`, `YSTRIDE0 +0x24`, `SRC_FORMAT +0x30`,
+`UNPACK_PATTERN +0x34`, `OP_MODE +0x38`, `MULTIRECT_OPMODE +0x170`. Sizes pack
+`(h << 16) | w` and positions `(y << 16) | x`, no size-1. The probe logs the
+live plane (`plane src_size ... out_size ... fmt ... multi ...`) and decodes
+`OUT_SIZE` against the panel over four packings, keeping the vendor one when
+nothing matches; `sweetfb_geom=0` restores the read-only behaviour for A/B.
 
 Flush (`CTL_FLUSH`, SSPP bit) + `CTL_START` go to every CTL that has a live
-`CTL_LAYER`, so the kick lands whichever control path drives DSI0. The
-`SRC_ADDR` write is read back: if it did not latch the plane is restored and
-the flip disabled for the boot, so the CPU copy keeps the screen alive
-instead of leaving a scramble on the panel.
+`CTL_LAYER`, so the kick lands whichever control path drives DSI0. `SRC_ADDR`
+is read back, and `OUT_SIZE` too when it was written: if a write did not latch
+the plane is restored and the flip disabled for the boot, so the CPU copy keeps
+the screen alive instead of leaving a scramble on the panel. The first eight
+flips log the whole plane so a wrong picture can be read from the log.
 
 **All the buffers must be scanout-able, not just the first.** The ABL
 carve-out is 24 MB in two 12 MB slots and slot 0 is the panel, so only one
