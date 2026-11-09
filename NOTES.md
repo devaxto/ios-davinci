@@ -46,16 +46,33 @@
      format warnings with `__attribute__((format(printf,1,2)))`),
      `tools/check-patches.py` -> `all patch hunk headers OK`,
      `tools/verify-patch-chain.py 0099 0100 0101 0102` -> `chain OK`.
-5. **Next:** push + `gh workflow run xnu.yml --ref gpu-bringup`, download the
-   kernel to `xnu/out-0102`, build `shim-boot-0102-feel.img` with the same
-   0100-feel cmdline **plus `sweetdpu=2`** (full vig0 dump: the pre-flip
-   `pool`/`plane` line, `vig0+0x000/0x008/0x00c/0x010/0x170`, any scaler
-   register, and the post-flip read-back), boot it, pull the log from
-   OrangeFox. If the picture is still wrong, the candidates in order are:
-   (a) `OUT_XY` left nonzero by the ABL (logged, not written), (b) `SRC_FORMAT`
-   bit 8 `SRCC3_EN` blending a CA surface whose alpha byte is 0, (c) a QSEED
-   scaler still enabled by the bootloader, (d) `SSPP_MULTIRECT_OPMODE` != 0.
-   Fallback for the user: `shim-boot-0096-touch.img` (`flip=0`).
+5. **CI + artifact + image DONE:** run **42645709295** (commit `116f74d`)
+   **success**; `xnu/out-0102/kernel.development.sweet` 17,317,080 B, SHA256
+   `054f6fefae0f33f27eeb241424cac2e97742d0e8c26c563abac409318094eb2e`. In the
+   binary: `plane src_size`, `out_size 0x%08x src_xy`, `SRC_SIZE 0x%08x
+   OUT_SIZE`, `multi 0x%08x`, `bootloader window is`, `window programmed`,
+   `flip did not stick (addr`, `geom-read-only`, `flip pool %u slots`.
+   Image `shim/out/shim-boot-0102-feel.img` 17,297,408 B, SHA256
+   `88723b1afd71ccd48d32eabc5dd49286d6fa8d5ecd4d8f3c579cff6adf9fe3a5`
+   (payload `d06757373bd18667...`, ramdisk byte-matches it, adt 10332 B).
+   Built by `python shim/out/_mk0102.py` (scratch helper: mkadt `--native` +
+   payload + make-boot in one call, because the PowerShell tool guard keeps
+   rejecting the long `mkpayload.py --cmdline` line with a bogus "rmdir"
+   error). Cmdline = the 0100-feel one with **`sweetdpu=2`**.
+6. **Next:** put davinci in fastboot and `fastboot boot
+   shim/out/shim-boot-0102-feel.img`, look at the panel, then OrangeFox +
+   `python tools/sweet-log-pull.py logs/boot-0102-feel.txt -s aa20029b`.
+   The log now carries the pre-flip dump: every nonzero word of vig0
+   (`+0x000..0x1ef`, so also `SRC_SIZE 0x000..`, `SRC_XY`, `OUT_SIZE`,
+   `OUT_XY`, `MULTIRECT 0x170`, any QSEED register), the `plane src_size ...
+   out_size ... fmt ... unpack ... opmode ... multi ...` line with `sizes
+   w-low` (vendor packing), and per-flip `flip N ... -> SRC_SIZE ... OUT_SIZE
+   ...` for the first 8 frames. If the picture is still wrong, the candidates
+   in order are: (a) `OUT_XY` left nonzero by the ABL (logged, not written),
+   (b) `SRC_FORMAT` bit 8 `SRCC3_EN` blending a CA surface whose alpha byte is
+   0, (c) a QSEED scaler still enabled by the bootloader, (d)
+   `SSPP_MULTIRECT_OPMODE` != 0. Fallback for the user:
+   `shim-boot-0096-touch.img` (`flip=0`).
 
 ### >>> UPDATE 2026-11-09 ~18:20 - 0101: flip on EVERY frame (pool + patch-chain guard) <<<
 
