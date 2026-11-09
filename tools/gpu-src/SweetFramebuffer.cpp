@@ -477,7 +477,7 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	uint32_t mask = get32(rec, 0x104);
 	uint32_t found = 0, id = 0;
 	int32_t sx, sy, ldx, ldy, lw, lh;
-	uint32_t crop_x, crop_y;
+	uint32_t crop_x, crop_y, flip_stride;
 	const uint8_t *a, *b;
 	SweetSurface *s;
 	uint64_t phys, scan;
@@ -566,8 +566,21 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	sweet_fb_clean_rows(src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
 	    (uint64_t)crop_x * 4u, (size_t)fb->fWidth * 4u,
 	    (int32_t)fb->fHeight, s->bytesPerRow);
-	/* Always program stride = panel/ABL rowbytes (never CA's 1125-wide bpr). */
-	if (!sweet_display_flip((uint32_t)scan, fb->fRowBytes)) {
+	/*
+	 * Pitch must match the buffer we point SRC_ADDR at.
+	 * ABL splash is 1080*4=4320; CA IOSurfaces are usually 64-byte
+	 * aligned (4352). Programming YSTRIDE=4320 while scanning a 4352
+	 * surface scrambled the panel (pink line / white tiles). For an
+	 * exact panel-sized present use the surface pitch; for crop mode
+	 * (>=2) we already require bytesPerRow == panel rowbytes.
+	 */
+	flip_stride = (crop_x == 0 && crop_y == 0) ?
+	    s->bytesPerRow : fb->fRowBytes;
+	if (flip_stride == 0 || flip_stride > 0xffffu) {
+		s->release();
+		return false;
+	}
+	if (!sweet_display_flip((uint32_t)scan, flip_stride)) {
 		s->release();
 		return false;
 	}
@@ -575,8 +588,10 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	fb->fFrameBytes = 0;
 	if (flip_logged < 8) {
 		flip_logged++;
-		IOLog("SWEET FB: flip surface %u pa 0x%llx crop %u,%u stride %u\n",
-		    s->id, (unsigned long long)scan, crop_x, crop_y, fb->fRowBytes);
+		IOLog("SWEET FB: flip surface %u pa 0x%llx crop %u,%u stride %u "
+		    "(surf bpr %u)\n",
+		    s->id, (unsigned long long)scan, crop_x, crop_y, flip_stride,
+		    s->bytesPerRow);
 	}
 	s->release();
 	return true;

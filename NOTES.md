@@ -14,9 +14,13 @@
    link → `can_flip` always false → forever ~10 MB CPU present. Matches
    `sweetfb_flip=1 but DPU layer not found` with **zero** DPU probe logs.
 
-3. **Fix 0098:** `0098-sweet-display-board-ifdef.patch` switches the guard
-   to `ARM64_BOARD_CONFIG_SWEET` (like sweet_gpu / Hakios). CI next; then
-   feel boot should log `SWEET DPU: flip ready` + `flip surface`.
+3. **Fix 0098 DONE:** CI **42536249635** SUCCESS. Kernel has real DPU code.
+   **Booted feel** ~00:58: `shim-boot-0098-feel.img` (`sweetfb_flip=1`).
+4. **REGRESSION (user ~01:01):** pink line + half black + white with squares
+   = scrambled scanout (same class as 0095 crop-flip). Flip finds a layer
+   but SRC_ADDR/stride wrong for davinci native. **Recover:** boot
+   `shim-boot-0096-touch.img` (`flip=0`). Next: pull feel log for
+   `SWEET DPU: flip ready on …`, fix SSPP pick / stride; keep flip off daily.
 
 4. **rdar:45025538 red bar:** native 1080x2340 ≠ real iPhone size. Fix =
    iPhone X 1125 + BoundingPath asset (or stay native and live with bar).
