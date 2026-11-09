@@ -49,15 +49,27 @@
      and the try_flip hook (stub headers, **no warnings**),
      `tools/check-patches.py` -> `all patch hunk headers OK` (72,471 B patch),
      `tools/verify-patch-chain.py 0099 0100 0101 0102 0103` -> `chain OK`.
-5. **Next:** (a) commit + push `gpu-bringup`, run CI `xnu.yml`, download
-   `xnu-kernel` to `xnu/out-0103`, build the image with
-   `python shim/out/_mk0103.py` (cmdline = 0102 + `sweetfb_probe=3
-   sweetfb_fetchtest=4`), verify with `unpack_bootv2.py`, `fastboot boot` it
-   once the phone is on the real bootloader; (b) pull the log again from
-   OrangeFox and read `SWEET FB: probe` / `fetchtest`; (c) if the markers
-   arrive intact, the remaining suspects are CA content and the alpha bit
-   (`SRC_FORMAT` bit 8 `SRCC3_EN`), which the same boot arg can then A/B.
-   Fallback image stays `shim-boot-0096-touch.img` (`flip=0`).
+5. **CI + artifact + image DONE:** run **42651131018** (commit `090236a`)
+   **success**; `xnu/out-0103/kernel.development.sweet` 17,317,272 B, SHA256
+   `87b02fb9e8169df626c22668416777a35bbc0f2a08ab4ac6911767b6ab30902a`. The
+   binary carries `SWEET FB: probe %s y %u x0/25/50/75`, `probe %ux%u bpr %u
+   %u samples` and `fetchtest %ux%u bpr %u <- panel stride`, plus every 0102
+   string (`plane src_size`, `SRC_SIZE`, `multi`, `flip did not stick`), so the
+   chain applied. Image `shim/out/shim-boot-0103-feel.img` 17,313,792 B, SHA256
+   `fd1bb031f5ec9eef7aa53f480e54c98acbf8dd39ec2daaeabb28eeee9963a91b` (payload
+   16,722,416 B SHA256 `6390e587d76ed2c7...`, ramdisk byte-matches it, adt
+   10332 B, dtb yes), built by `python shim/out/_mk0103.py`. Note:
+   `shutil.which('clang')` is empty inside the Python process (the shell does
+   see clang), so the helper passes `--cc`/`--objcopy`/`--nm` explicitly from
+   `C:\Program Files\LLVM\bin`. Cmdline = 0102 + `sweetfb_probe=3
+   sweetfb_fetchtest=4`.
+6. **Next:** (a) phone to recovery -> `adb -s aa20029b reboot bootloader` ->
+   `fastboot boot shim/out/shim-boot-0103-feel.img` (one boot only); (b) pull
+   the log from OrangeFox and read `SWEET FB: probe` / `fetchtest`; (c) if the
+   markers arrive intact the fetch path is proven and the remaining suspects
+   are CA's content and the alpha bit (`SRC_FORMAT` bit 8 `SRCC3_EN`), which a
+   single boot arg can A/B next. Fallback image stays `shim-boot-0096-touch.img`
+   (`flip=0`).
 
 ### >>> UPDATE 2026-11-09 ~19:40 - 0102: the DSPP/SSPP rect offsets were 0x30 off <<<
 
