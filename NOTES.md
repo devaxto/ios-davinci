@@ -59,9 +59,14 @@
    payload + make-boot in one call, because the PowerShell tool guard keeps
    rejecting the long `mkpayload.py --cmdline` line with a bogus "rmdir"
    error). Cmdline = the 0100-feel one with **`sweetdpu=2`**.
-6. **Next:** put davinci in fastboot and `fastboot boot
-   shim/out/shim-boot-0102-feel.img`, look at the panel, then OrangeFox +
-   `python tools/sweet-log-pull.py logs/boot-0102-feel.txt -s aa20029b`.
+6. **BOOTED 2026-11-09 16:51 local**: the phone was in OrangeFox
+   (`adb -s aa20029b reboot bootloader`), `fastboot boot
+   shim/out/shim-boot-0102-feel.img` -> Sending (16892 KB) OKAY 0.398s, Booting
+   OKAY 0.136s. Awaiting the panel + `logs/boot-0102-feel.txt`.
+7. **Next:** pull the log from OrangeFox
+   (`python tools/sweet-log-pull.py logs/boot-0102-feel.txt -s aa20029b`, do
+   **not** boot anything else first - the ring lives in userdata and is
+   overwritten by the next boot).
    The log now carries the pre-flip dump: every nonzero word of vig0
    (`+0x000..0x1ef`, so also `SRC_SIZE 0x000..`, `SRC_XY`, `OUT_SIZE`,
    `OUT_XY`, `MULTIRECT 0x170`, any QSEED register), the `plane src_size ...
