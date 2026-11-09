@@ -157,6 +157,25 @@ nonzero and below 4 GB (flip pool, splash slot or contiguous DRAM). Anything
 else (multi-layer, partial rect, non-contiguous) keeps the CPU copy. A wrong
 flip can still tear; it can no longer strand the panel.
 
+### 0103 — what is in the buffer (`sweetfb_probe`, `sweetfb_fetchtest`)
+
+A correct plane can still show noise, because the flip fetches whatever sits at
+that physical address. Two boot args cut that down without touching a plane
+register:
+
+- `sweetfb_probe=N` (default 3): for the first N flips, log how many of the
+  surface's sampled pixels are zero or fully opaque, and the pixels at 0/25/50/75
+  % of the top, middle and last row (`SWEET FB: probe ...`). A frame
+  CoreAnimation drew is neither all-zero nor all-opaque, and it varies across a
+  row; uninitialised or half-drawn memory reads as one value.
+- `sweetfb_fetchtest=N` (default 0, off): for the first N flips, overwrite the
+  surface with the panel buffer's own content (what the DPU already scans
+  correctly) and paint markers - 100 blue rows at the top, green at y = 1000,
+  red at the bottom, a red bar down the left edge (`SWEET FB: fetchtest`).
+  Intact markers prove address, pitch and window; sheared or repeated markers
+  mean the fetch geometry is wrong; no markers mean that physical address is
+  not fetched at all.
+
 ### After the flip: hardware layers
 
 The DPU scans several SSPPs into one mixer with per-stage blending. Once a

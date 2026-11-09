@@ -477,6 +477,115 @@ AppleCLCD::swap(const uint8_t *rec)
 }
 
 /*
+ * 0103 diagnostics. A flipped frame comes out as noise for one of two very
+ * different reasons: the surface the plane was pointed at never held a frame
+ * (the renderer draws somewhere else, or not yet), or the plane does not
+ * fetch what the CPU can read at that physical address and pitch.
+ * sweetfb_probe=N logs what the surface holds (zero/opaque counts, a few
+ * pixels per row) and sweetfb_fetchtest=N replaces the next N flips with the
+ * panel buffer's own content plus colour bands: those bands on the panel
+ * prove the address, pitch and window of the fetch, whatever CoreAnimation
+ * had put in the surface.
+ */
+static int32_t sweet_fb_probe_left = -1;
+static int32_t sweet_fb_fetchtest_left = -1;
+
+static uint32_t
+sweet_fb_boot_u32(const char *name, uint32_t def)
+{
+	uint32_t v = def;
+
+	if (!PE_parse_boot_argn(name, &v, sizeof(v))) {
+		return def;
+	}
+	return v;
+}
+
+static void
+sweet_fb_probe_rows(const char *tag, const uint8_t *base, uint32_t bpr,
+    uint32_t w, uint32_t y)
+{
+	const uint32_t *p = (const uint32_t *)(base + (uint64_t)y * bpr);
+	uint32_t c[4];
+
+	for (uint32_t i = 0; i < 4; i++) {
+		c[i] = p[(uint64_t)w * i / 4];
+	}
+	IOLog("SWEET FB: probe %s y %u x0/25/50/75 0x%08x 0x%08x 0x%08x 0x%08x\n",
+	    tag, y, c[0], c[1], c[2], c[3]);
+}
+
+static void
+sweet_fb_probe_surface(const uint8_t *base, uint32_t bpr, uint32_t w,
+    uint32_t h)
+{
+	uint32_t zero = 0, opaque = 0, n = 0, first = 0, last = 0;
+
+	for (uint32_t y = 0; y < h; y += 16) {
+		const uint32_t *p = (const uint32_t *)(base + (uint64_t)y * bpr);
+
+		for (uint32_t x = 0; x < w; x += 16) {
+			uint32_t v = p[x];
+
+			if (v == 0) {
+				zero++;
+			}
+			if ((v >> 24) == 0xffu) {
+				opaque++;
+			}
+			if (n == 0) {
+				first = v;
+			}
+			last = v;
+			n++;
+		}
+	}
+	IOLog("SWEET FB: probe %ux%u bpr %u %u samples, %u zero, %u opaque, "
+	    "first 0x%08x last 0x%08x\n", w, h, bpr, n, zero, opaque, first, last);
+	sweet_fb_probe_rows("top", base, bpr, w, 0);
+	sweet_fb_probe_rows("mid", base, bpr, w, h / 2);
+	sweet_fb_probe_rows("end", base, bpr, w, h - 1);
+}
+
+/*
+ * Overwrite the frame the plane is about to fetch with content the DPU
+ * already scans correctly (the panel buffer), plus markers: 100 blue rows at
+ * the top, green at the middle, red at the bottom, and a red bar down the
+ * left edge. Markers that arrive sheared or repeated mean the fetch pitch or
+ * window is wrong; no markers at all mean this address is not fetched.
+ */
+static void
+sweet_fb_fetchtest(uint8_t *dst, uint32_t bpr, uint32_t w, uint32_t h,
+    const uint8_t *panel, uint32_t panel_stride)
+{
+	size_t row = (size_t)w * 4u;
+
+	for (uint32_t y = 0; y < h; y++) {
+		memcpy(dst + (uint64_t)y * bpr,
+		    panel + (uint64_t)y * panel_stride, row);
+	}
+	for (uint32_t y = 0; y < h; y++) {
+		uint32_t *p = (uint32_t *)(dst + (uint64_t)y * bpr);
+		bool full = (y < 100u || (y >= 1000u && y < 1100u) ||
+		    y >= h - 100u);
+
+		if (full) {
+			uint32_t mark = y < 100u ? 0xffff0000u :
+			    (y < 1100u ? 0xff00ff00u : 0xff0000ffu);
+
+			for (uint32_t x = 0; x < w; x++) {
+				p[x] = mark;
+			}
+		}
+		for (uint32_t x = 0; x < 24u && x < w; x++) {
+			p[x] = 0xff0000ffu;
+		}
+	}
+	IOLog("SWEET FB: fetchtest %ux%u bpr %u <- panel stride %u, bands "
+	    "painted\n", w, h, bpr, panel_stride);
+}
+
+/*
  * Zero-copy present: point the live SSPP at the CA surface and let the DPU
  * fetch it. The bootloader's pipeline is kept (same format, same panel-sized
  * source window, same mixers); only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY move,
@@ -581,6 +690,24 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	    (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
 		s->release();
 		return false;
+	}
+	if (sweet_fb_probe_left < 0) {
+		sweet_fb_probe_left = (int32_t)sweet_fb_boot_u32("sweetfb_probe", 3);
+		sweet_fb_fetchtest_left =
+		    (int32_t)sweet_fb_boot_u32("sweetfb_fetchtest", 0);
+	}
+	if (sweet_fb_probe_left > 0) {
+		sweet_fb_probe_left--;
+		sweet_fb_probe_surface((const uint8_t *)(src + s->offset +
+		    (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u),
+		    s->bytesPerRow, fb->fWidth, fb->fHeight);
+	}
+	if (sweet_fb_fetchtest_left > 0) {
+		sweet_fb_fetchtest_left--;
+		sweet_fb_fetchtest((uint8_t *)(src + s->offset +
+		    (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u),
+		    s->bytesPerRow, fb->fWidth, fb->fHeight,
+		    (const uint8_t *)fb->fPixels, fb->fRowBytes);
 	}
 	sweet_fb_clean_rows(src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
 	    (uint64_t)crop_x * 4u, (size_t)fb->fWidth * 4u,
