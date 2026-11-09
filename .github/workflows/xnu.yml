@@ -41,6 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check patch hunk headers
+        # git apply rejects a hunk whose @@ counts are off with "corrupt patch",
+        # and build.sh only warns - the kernel then silently keeps older sources
+        # (that is how 0099+0100 were lost in run 42625286745).
+        run: python3 tools/check-patches.py
+
       - name: Fetch build script
         run: |
           git init -q dxb
@@ -72,7 +78,28 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+
+      - name: Fail on skipped patches
+        if: always()
+        run: |
+          # build.sh warns (and continues) when git apply rejects a patch, which
+          # leaves the kernel at older sources with a green run. Our patches are
+          # the numbered ones; blacktop's own are expected to be skipped.
+          [ -f dxb/build.log ] || { echo "::error::no build.log"; exit 1; }
+          skipped=0
+          for p in xnu/patches/*.patch; do
+            name=$(basename "$p")
+            if grep -qF "Skipping patch $GITHUB_WORKSPACE/dxb/patches/$name " dxb/build.log; then
+              grep -nF "patches/$name " dxb/build.log | head -2
+              echo "::error::$name did not apply to the xnu tree"
+              skipped=1
+            fi
+          done
+          [ "$skipped" -eq 0 ] || exit 1
+          echo "all $(ls xnu/patches/*.patch | wc -l | tr -d ' ') patches applied"
 
       - name: Package build tree for local compiles
         if: always()

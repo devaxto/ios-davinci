@@ -2,6 +2,64 @@
 
 ## Agent handoff / active work (2026-11-08, latest)
 
+### >>> UPDATE 2026-11-09 ~18:20 - 0101: flip on EVERY frame (pool + patch-chain guard) <<<
+
+1. **The bad news first:** CI run **42625286745** (commit `fae6f6a`) finished
+   green but the kernel it produced contains **none** of the 0099/0100 code.
+   `build.sh` only *warns* when `git apply` rejects a patch:
+   - `0099 ... error: corrupt patch at line 49` - its second hunk declared
+     `@@ -566,17 +566,33 @@` while carrying 32 lines (+1 too many), and
+     `tools/check-patches.py` now proves it: `declares 17/33, found 17/32`.
+   - `0100 ... patch failed: iokit/Kernel/arm/SweetFramebuffer.cpp:1` - it was
+     generated against the post-0099 file, so losing 0099 took it down too
+     (git apply is atomic per file).
+   The kernel strings still say `flip surface %u pa 0x%llx crop %u,%u stride
+   %u` and `flip ready on %s ...` - i.e. the 0096/0098 sources.
+2. **Fixed:** 0099 hunk header corrected (17/32). Two new tools:
+   - `tools/check-patches.py` - validates every `@@` count (CI runs it before
+     the build, and `Fail on skipped patches` now greps the build log for our
+     numbered patches, so a skipped patch can never hide behind a green run).
+   - `tools/verify-patch-chain.py 0099 0100 0101` - replays the chain in a
+     scratch tree seeded from commit `11b0731` and diffs each step against the
+     `tools/gpu-src/*.NNNN.*` snapshots. **chain OK** at the time of writing.
+3. **Why 0100 alone still could not feel like a flip:** the ABL carve-out is
+   24 MB carved into two 12 MB slots - slot 0 is the panel, so CoreAnimation
+   gets **one** CA slot (boot log: `(1 CA slots)`, surface 2 at 0x9cc00000,
+   surface 3 `phys 0x0`). CA rotates *two* 1125x2436 surfaces, so every other
+   present would fall back to the CPU copy while the DPU was still scanning
+   the flipped one -> frozen/stuttering output, not a working flip.
+4. **0101** (`xnu/patches/0101-sweet-fb-flip-pool.patch`, gen_0101_patch.py):
+   - `sweet_surface_flip_pool()` reserves 3 physically contiguous below-4 GB
+     buffers (12 MB each, `sweetfb_flipslots`, default 3) in `start()` and
+     hands them to full-screen layers **before** the splash slot; the slot goes
+     back to the pool on `SweetSurface::free()`. Every surface CA rotates
+     through is then scanout-able. If the contiguous alloc fails it logs
+     `flip pool slot N ... contiguous alloc failed` and behaviour falls back
+     to today's single slot.
+   - `SweetDisplay`: the size packing is decoded as **4 candidates**
+     (w-low/w-high x size/size-1) from the live DST_SIZE, SRC_SIZE/DST_SIZE
+     are written **only** when the window size really changes (a panel-sized
+     flip touches just SRC_ADDR + YSTRIDE0), SRC_XY only when the origin
+     changes, and the probe now logs `-src WxH dst WxH sizes <enc>`.
+   - `SweetFramebuffer::present` calls `sweet_display_flip_reset()` before any
+     CPU copy path (no-op when the plane was never moved), so a frame that
+     cannot flip repoints the DPU at the splash buffer instead of painting
+     invisible memory.
+5. **Next:** `gh workflow run xnu.yml --ref gpu-bringup`; **verify the artifact
+   before booting** - `strings xnu/out-0101/kernel.development.sweet | grep
+   'flip pool'` / `grep 'sizes %s'` must hit, otherwise the patches were
+   skipped again (the run would now be red). Then build
+   `shim-boot-0101-feel.img` with `sweetfb_flip=1 sweetfb_native=1
+   sweetfb_noconsole=1 sweetfb_cache=1 sweetdpu=1 davinci_touch_probeonly=0`.
+   Expect in the log: `SWEET SURF: flip pool 3 slots ...`, `SWEET DPU: plane
+   ... sizes w-low`, `SWEET SURF: flip slot 0/1 pa 0x...`, `SWEET FB: flip
+   surface 2 pa ... crop 22,48 stride 4608 panel 1080x2340` and `present N ...
+   (flips N)` with no `crop-copy` lines after the first frames. If the panel
+   still scrambles, boot `sweetfb_flip=0` and pull the `plane` line - it tells
+   us whether the fail was geometry, packing or latch.
+
+---
+
 ### >>> UPDATE 2026-11-09 ~14:30 - 0100: real DPU flip (geometry + latch check) <<<
 
 1. **User:** "no facciamo un flip dpu funzionante pero' cazzo" - the flip has

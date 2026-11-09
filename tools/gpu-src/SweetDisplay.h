@@ -35,16 +35,19 @@ bool sweet_display_can_flip(void);
  * buffer (0,0 for an exact panel surface; the centered crop for a larger
  * logical surface), width/height default to the panel rect when 0.
  *
- * Only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY are written (SRC_SIZE/DST_SIZE only
- * when the window differs from the bootloader's), then every live CTL is
- * flushed and kicked. Returns false if the probe did not find a layer, the
- * DPU mapping is gone, the size encoding could not be derived for a window
- * change, or the write did not latch (the plane is restored first).
+ * Only SRC_ADDR and SRC_YSTRIDE0 are written for a panel-sized flip;
+ * SRC_SIZE/DST_SIZE change only when the window size differs from the
+ * bootloader's and SRC_XY only when the origin does, so the mixer, format and
+ * any scaler stay untouched. Every live CTL is then flushed and kicked.
+ * Returns false if the probe did not find a layer, the DPU mapping is gone, the
+ * size encoding could not be derived for a window change, or the write did not
+ * latch (the plane is restored first).
  */
 bool sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
     uint32_t width, uint32_t height);
 
-/* Restore the original ABL splash PA (for power-off fade / panic path). */
+/* Restore the original ABL splash PA and geometry. Cheap no-op when the plane
+ * was never moved, so the CPU-copy path can call it on every present. */
 void sweet_display_flip_reset(void);
 
 #ifdef __cplusplus

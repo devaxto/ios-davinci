@@ -222,6 +222,19 @@ AppleCLCD::start(IOService *provider)
 		sweet_surface_set_splash_pool(fPhys, 24u << 20, (24u << 20) / 2);
 		fFlipMode = 1;
 		PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
+		/*
+		 * The carve-out only holds one CA surface, but CoreAnimation keeps
+		 * two or three in rotation; without contiguous slots for all of
+		 * them only every other frame could flip, and the frames that fell
+		 * back to a copy were invisible (the DPU was still scanning the
+		 * flipped surface).
+		 */
+		if (fFlipMode != 0) {
+			uint32_t slots = 3;
+
+			PE_parse_boot_argn("sweetfb_flipslots", &slots, sizeof(slots));
+			sweet_surface_flip_pool((24u << 20) / 2, slots);
+		}
 	}
 	if (fCacheMode != 0 && fSurface != NULL) {
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
@@ -716,6 +729,13 @@ AppleCLCD::present(const uint8_t *rec)
 	if (sweet_fb_try_flip(this, rec)) {
 		return;
 	}
+	/*
+	 * A previous frame may have left the plane on a CA surface. Point it back
+	 * at the splash buffer before copying into it, or this frame would paint
+	 * memory nobody scans out (and the panel would freeze on the old flip).
+	 * Cheap no-op when the plane was never moved.
+	 */
+	sweet_display_flip_reset();
 	if (sweet_fb_try_crop_copy(this, rec)) {
 		return;
 	}

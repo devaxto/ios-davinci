@@ -104,7 +104,7 @@ Nothing is written, no clock or GDSC is touched; if the SDE reads back
 0/0xffffffff the dump stops instead of hammering a gated block. Read the
 log for `SWEET DPU:` lines after a boot.
 
-### 0088/0100 — the flip (`sweetfb_flip=1`, on by default)
+### 0088/0100/0101 — the flip (`sweetfb_flip=1`, on by default)
 
 One present becomes: clean the surface (dc cvac over the written rect, the
 DPU is not cache coherent) + point the live SSPP at it. The bootloader's
@@ -116,10 +116,13 @@ window - only three registers move:
   4320 - a mismatched pitch is what scrambled 0095 and 0098;
 - `SRC_XY` = the panel crop inside the surface: 0,0 on a native present,
   `fOffX,fOffY` (22,48) when CA draws 1125x2436 for the 1080x2340 panel,
-  i.e. exactly the window the CPU crop-copy moves;
-- `SRC_SIZE`/`DST_SIZE` change only when the window does, and only with the
-  size-vs-size-1 encoding the probe derived from the live `DST_SIZE`; an
-  undecodable encoding keeps the bootloader geometry and refuses crops.
+  i.e. exactly the window the CPU crop-copy moves - and only when it differs
+  from what the bootloader left;
+- `SRC_SIZE`/`DST_SIZE` change only when the window *size* does, and only
+  with the packing the probe decoded from the live `DST_SIZE` out of four
+  candidates (width in the low or high half, size or size-1). A panel-sized
+  flip therefore leaves the mixer, format and any scaler untouched; an
+  undecodable packing keeps the bootloader geometry and refuses crops.
 
 Flush (`CTL_FLUSH`, SSPP bit) + `CTL_START` go to every CTL that has a live
 `CTL_LAYER`, so the kick lands whichever control path drives DSI0. The
@@ -127,11 +130,22 @@ Flush (`CTL_FLUSH`, SSPP bit) + `CTL_START` go to every CTL that has a live
 the flip disabled for the boot, so the CPU copy keeps the screen alive
 instead of leaving a scramble on the panel.
 
+**All the buffers must be scanout-able, not just the first.** The ABL
+carve-out is 24 MB in two 12 MB slots and slot 0 is the panel, so only one
+CA-sized surface fits there; CoreAnimation keeps two or three in rotation and
+the overflow ones land on wired pages the DPU cannot address (no SMMU map).
+`sweet_surface_flip_pool()` (0101) therefore reserves three physically
+contiguous below-4 GB 12 MB buffers at `start()` (`sweetfb_flipslots`) and
+hands them to full-screen layers before the splash slot, returning the slot
+on `SweetSurface::free()`. Frames that still cannot flip call
+`sweet_display_flip_reset()` first, so the plane goes back to the splash
+buffer before any CPU copy paints it.
+
 Preconditions checked at runtime: exactly one enabled full-screen BGRA layer
 whose dest is the panel (or the whole logical size), `sweet_surface_phys()`
-nonzero and below 4 GB (splash slot or contiguous DRAM). Anything else
-(multi-layer, partial rect, non-contiguous) keeps the CPU copy. A wrong flip
-can still tear; it can no longer strand the panel.
+nonzero and below 4 GB (flip pool, splash slot or contiguous DRAM). Anything
+else (multi-layer, partial rect, non-contiguous) keeps the CPU copy. A wrong
+flip can still tear; it can no longer strand the panel.
 
 ### After the flip: hardware layers
 

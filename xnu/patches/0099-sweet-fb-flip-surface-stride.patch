@@ -9,7 +9,7 @@
  	const uint8_t *a, *b;
  	SweetSurface *s;
  	uint64_t phys, scan;
-@@ -566,17 +566,33 @@
+@@ -566,17 +566,32 @@
  	sweet_fb_clean_rows(src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
  	    (uint64_t)crop_x * 4u, (size_t)fb->fWidth * 4u,
  	    (int32_t)fb->fHeight, s->bytesPerRow);

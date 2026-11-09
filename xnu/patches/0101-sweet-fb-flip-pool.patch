@@ -1,0 +1,5754 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1,1066 +1,1186 @@
+-/*
+- * Built-in IOSurface for SWEET.
+- *
+- * Apple's IOSurface kext is closed. IOSurface.framework (iOS 16.7) finds
+- * IOServiceNameMatching("IOCoreSurfaceRoot"), opens it with type 0 and
+- * talks to the user client below:
+- *
+- *   sel 13  limits: struct out 0x18, u16 at +0x16 must be 1 (ABI version),
+- *           +0 offset alignment mask, +4 bytes-per-row alignment mask
+- *   sel 0   create: scalar [parent id], struct in = serialized property
+- *           dictionary (binary or XML), struct out = lock result (0xa68)
+- *   sel 4   lookup by id: scalar [id], struct out = lock result
+- *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+- *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+- *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+- *           (id, options, &seed), 4/5 release (id)
+- *
+- * The lock result tells the library where the surface lives in the
+- * caller's address space: +0 pixels, +8 shared state page (registry id,
+- * seed at +0xc), +0x10 timestamps, then id, sizes and geometry (layout in
+- * sweet_surface_fill_result). Every surface is wired kernel memory mapped
+- * into each task that creates or looks it up; mappings are counted per
+- * client and dropped on release or close.
+- *
+- * Values, notifications, accelerators and shared events are accepted and
+- * ignored (logged once per selector).
+- */
+-#include "SweetSurface.h"
+-
+-#if defined(SWEET)
+-#include <IOKit/IOService.h>
+-#include <IOKit/IOUserClient.h>
+-#include <IOKit/IOKitKeys.h>
+-#include <IOKit/IOLib.h>
+-#include <IOKit/IOLocks.h>
+-#include <IOKit/system.h>
+-#include <libkern/c++/OSArray.h>
+-#include <libkern/c++/OSDictionary.h>
+-#include <libkern/c++/OSNumber.h>
+-#include <libkern/c++/OSUnserialize.h>
+-#include <pexpert/pexpert.h>
+-#include <sys/proc.h>
+-
+-enum {
+-	kSweetSurfaceCreate             = 0,
+-	kSweetSurfaceLookup             = 4,
+-	kSweetSurfaceLimits             = 13,
+-	kSweetSurfaceLookupFromPort     = 34,
+-	kSweetSurfaceCreatePort         = 35,
+-};
+-
+-enum {
+-	kSweetSurfaceTrapIncrementUse   = 0,
+-	kSweetSurfaceTrapDecrementUse   = 1,
+-	kSweetSurfaceTrapLock           = 2,
+-	kSweetSurfaceTrapUnlock         = 3,
+-	kSweetSurfaceTrapRelease        = 4,
+-	kSweetSurfaceTrapReleaseFailed  = 5,
+-};
+-
+-#define SWEET_SURFACE_RESULT_SIZE       0xa68
+-#define SWEET_SURFACE_MAX_ID            4096
+-#define SWEET_SURFACE_MAX_DIM           16384
+-#define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+-#define SWEET_SURFACE_MAX_PROPS         (64u << 10)
+-#define SWEET_SURFACE_ROW_ALIGN         64
+-#define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+-#define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+-#define kIOSurfaceLockReadOnly          0x1
+-
+-static IOLock       *sweet_surface_lock;
+-static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+-static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+-static uint32_t      sweet_surface_next_id = 1;
+-static uint32_t      sweet_surface_creates_logged;
+-static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+-#define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+-
+-OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+-
+-void
+-SweetSurface::free()
+-{
+-	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+-		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+-	}
+-	OSSafeReleaseNULL(kernelMap);
+-	OSSafeReleaseNULL(memory);
+-	OSSafeReleaseNULL(state);
+-	OSObject::free();
+-}
+-
+-uintptr_t
+-SweetSurface::kernelAddress()
+-{
+-	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, memory);
+-	if (buffer != NULL) {
+-		return (uintptr_t)buffer->getBytesNoCopy();
+-	}
+-	IOLockLock(sweet_surface_lock);
+-	if (kernelMap == NULL && memory != NULL) {
+-		/* Splash / physical surfaces: honour mapCache (copyback for DPU flip). */
+-		kernelMap = memory->map(mapCache != 0 ? mapCache : kIOMapWriteCombineCache);
+-	}
+-	IOLockUnlock(sweet_surface_lock);
+-	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+-}
+-
+-static uint32_t *
+-sweet_surface_seed(SweetSurface *s)
+-{
+-	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
+-}
+-
+-/*
+- * Give the surface an id and a table slot; the table holds one retain and a
+- * user count (creators, client mappings, kernel holders). Lock held.
+- */
+-static bool
+-sweet_surface_insert_locked(SweetSurface *s)
+-{
+-	for (uint32_t n = 0; n < SWEET_SURFACE_MAX_ID - 1; n++) {
+-		uint32_t id = sweet_surface_next_id;
+-		sweet_surface_next_id = id + 1 < SWEET_SURFACE_MAX_ID ? id + 1 : 1;
+-		if (sweet_surface_table[id] == NULL) {
+-			s->id = id;
+-			s->retain();
+-			sweet_surface_table[id] = s;
+-			sweet_surface_users[id] = 1;
+-			*(uint64_t *)s->state->getBytesNoCopy() = id;   /* registry id */
+-			return true;
+-		}
+-	}
+-	return false;
+-}
+-
+-/* Add a user to a surface that may have left the table (port lookups). */
+-static bool
+-sweet_surface_get(SweetSurface *s)
+-{
+-	bool ok = true;
+-	IOLockLock(sweet_surface_lock);
+-	if (sweet_surface_table[s->id] == s) {
+-		sweet_surface_users[s->id]++;
+-	} else if (sweet_surface_table[s->id] == NULL) {
+-		s->retain();
+-		sweet_surface_table[s->id] = s;
+-		sweet_surface_users[s->id] = 1;
+-	} else {
+-		ok = false;
+-	}
+-	IOLockUnlock(sweet_surface_lock);
+-	return ok;
+-}
+-
+-/* Drop a user; the last one removes the surface from the table. */
+-static void
+-sweet_surface_put(SweetSurface *s)
+-{
+-	bool drop = false;
+-	IOLockLock(sweet_surface_lock);
+-	if (sweet_surface_table[s->id] == s && --sweet_surface_users[s->id] == 0) {
+-		sweet_surface_table[s->id] = NULL;
+-		drop = true;
+-	}
+-	IOLockUnlock(sweet_surface_lock);
+-	if (drop) {
+-		s->release();
+-	}
+-}
+-
+-SweetSurface *
+-sweet_surface_copy(uint32_t id)
+-{
+-	SweetSurface *s = NULL;
+-	if (id == 0 || id >= SWEET_SURFACE_MAX_ID || sweet_surface_lock == NULL) {
+-		return NULL;
+-	}
+-	IOLockLock(sweet_surface_lock);
+-	s = sweet_surface_table[id];
+-	if (s != NULL) {
+-		s->retain();
+-	}
+-	IOLockUnlock(sweet_surface_lock);
+-	return s;
+-}
+-
+-/* The table lock; the framebuffer may publish a surface before the root starts. */
+-static void
+-sweet_surface_init_lock(void)
+-{
+-	if (sweet_surface_lock == NULL) {
+-		IOLock *lock = IOLockAlloc();
+-		if (!OSCompareAndSwapPtr(NULL, lock, &sweet_surface_lock)) {
+-			IOLockFree(lock);
+-		}
+-	}
+-}
+-
+-static SweetSurface *
+-sweet_surface_alloc(void)
+-{
+-	sweet_surface_init_lock();
+-	SweetSurface *s = OSTypeAlloc(SweetSurface);
+-	if (s == NULL || !s->init()) {
+-		OSSafeReleaseNULL(s);
+-		return NULL;
+-	}
+-	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
+-	if (s->state == NULL) {
+-		s->release();
+-		return NULL;
+-	}
+-	bzero(s->state->getBytesNoCopy(), page_size);
+-	return s;
+-}
+-
+-static bool
+-sweet_surface_publish(SweetSurface *s)
+-{
+-	bool ok;
+-	IOLockLock(sweet_surface_lock);
+-	ok = sweet_surface_insert_locked(s);
+-	IOLockUnlock(sweet_surface_lock);
+-	return ok;
+-}
+-
+-#define SWEET_SPLASH_SLOTS      3
+-
+-static struct {
+-	uint64_t phys;
+-	uint32_t region;
+-	uint32_t slot;
+-	uint32_t used;          /* bit i = slot i taken (slot 0 = panel) */
+-	int      enabled;
+-} g_splash;
+-
+-void
+-sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
+-    uint32_t slot_bytes)
+-{
+-	int on = 1;
+-
+-	PE_parse_boot_argn("sweetfb_splash", &on, sizeof(on));
+-	g_splash.enabled = 0;
+-	g_splash.phys = 0;
+-	g_splash.region = 0;
+-	g_splash.slot = 0;
+-	g_splash.used = 0;
+-	if (on <= 0 || phys == 0 || region_bytes < slot_bytes * 2 || slot_bytes == 0) {
+-		IOLog("SWEET SURF: splash pool off\n");
+-		return;
+-	}
+-	slot_bytes = (uint32_t)round_page(slot_bytes);
+-	if (slot_bytes * 2 > region_bytes) {
+-		IOLog("SWEET SURF: splash region too small for 2 slots\n");
+-		return;
+-	}
+-	g_splash.phys = phys;
+-	g_splash.region = region_bytes;
+-	g_splash.slot = slot_bytes;
+-	g_splash.used = 1u;     /* slot 0 = panel framebuffer */
+-	g_splash.enabled = 1;
+-	IOLog("SWEET SURF: splash pool pa 0x%llx region %u slot %u (%u CA slots)\n",
+-	    (unsigned long long)phys, region_bytes, slot_bytes,
+-	    region_bytes / slot_bytes - 1);
+-}
+-
+-static bool
+-sweet_surface_is_display_layer(SweetSurface *s)
+-{
+-	if (s == NULL) {
+-		return false;
+-	}
+-	if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+-		return false;
+-	}
+-	if (s->width < 720 || s->height < 1280 || s->allocSize < (2u << 20)) {
+-		return false;
+-	}
+-	return true;
+-}
+-
+-/*
+- * Prefer a splash slot (DPU already scans this RAM). Falls back to contiguous
+- * DRAM only when sweetfb_flip=1 and splash is exhausted/off.
+- */
+-static bool
+-sweet_surface_want_contig(SweetSurface *s)
+-{
+-	static int flip = -1;
+-
+-	if (flip < 0) {
+-		flip = 0;
+-		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
+-	}
+-	return flip > 0 && sweet_surface_is_display_layer(s);
+-}
+-
+-static IOMemoryDescriptor *
+-sweet_surface_splash_alloc(SweetSurface *s, uint64_t *out_pa)
+-{
+-	uint32_t i, n;
+-	uint64_t pa;
+-
+-	*out_pa = 0;
+-	if (!g_splash.enabled || !sweet_surface_is_display_layer(s)) {
+-		return NULL;
+-	}
+-	if (s->allocSize > g_splash.slot) {
+-		return NULL;
+-	}
+-	n = g_splash.region / g_splash.slot;
+-	if (n > SWEET_SPLASH_SLOTS) {
+-		n = SWEET_SPLASH_SLOTS;
+-	}
+-	for (i = 1; i < n; i++) {
+-		if (g_splash.used & (1u << i)) {
+-			continue;
+-		}
+-		pa = g_splash.phys + (uint64_t)i * g_splash.slot;
+-		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa,
+-		    s->allocSize, kIODirectionInOut);
+-		if (md == NULL) {
+-			return NULL;
+-		}
+-		g_splash.used |= (1u << i);
+-		*out_pa = pa;
+-		IOLog("SWEET SURF: splash slot %u pa 0x%llx size %u\n",
+-		    i, (unsigned long long)pa, s->allocSize);
+-		return md;
+-	}
+-	return NULL;
+-}
+-
+-/*
+- * Record the PA when the descriptor is a single contiguous segment below 4 GB
+- * (the DPU address path the bootloader left is 32-bit, SMMU bypassed).
+- */
+-static void
+-sweet_surface_capture_phys(SweetSurface *s)
+-{
+-	IOByteCount len = 0;
+-	addr64_t pa;
+-
+-	s->physAddr = 0;
+-	if (s->memory == NULL || s->allocSize == 0) {
+-		return;
+-	}
+-	pa = s->memory->getPhysicalSegment(0, &len);
+-	if (pa == 0 || len < s->allocSize || pa > 0xffffffffull ||
+-	    (pa + s->allocSize) > 0x100000000ull) {
+-		return;
+-	}
+-	s->physAddr = pa;
+-}
+-
+-uint64_t
+-sweet_surface_phys(SweetSurface *s)
+-{
+-	if (s == NULL || s->physAddr == 0) {
+-		return 0;
+-	}
+-	return s->physAddr + s->offset;
+-}
+-
+-SweetSurface *
+-sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+-    uint32_t bytesPerRow, uint32_t pixelFormat)
+-{
+-	SweetSurface *s = sweet_surface_alloc();
+-	if (s == NULL) {
+-		return NULL;
+-	}
+-	s->width = width;
+-	s->height = height;
+-	s->bytesPerRow = bytesPerRow;
+-	s->bytesPerElement = 4;
+-	s->elementWidth = s->elementHeight = 1;
+-	s->pixelFormat = pixelFormat;
+-	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
+-	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+-	s->mapCache = kIOMapWriteCombineCache;
+-	s->physAddr = (phys != 0 && phys <= 0xffffffffull) ? phys : 0;
+-	if (s->memory == NULL || !sweet_surface_publish(s)) {
+-		s->release();
+-		return NULL;
+-	}
+-	return s;
+-}
+-
+-mach_port_name_t
+-sweet_surface_port_in_task(SweetSurface *s, task_t task)
+-{
+-	mach_port_name_t name = 0;
+-	IOUserClient::copyPortNameForObjectInTask(task, s, &name);
+-	return name;
+-}
+-
+-static uint32_t
+-sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
+-{
+-	OSNumber *n = OSDynamicCast(OSNumber, dict->getObject(key));
+-	return n != NULL ? n->unsigned32BitValue() : def;
+-}
+-
+-static uint32_t
+-sweet_div_up(uint32_t a, uint32_t b)
+-{
+-	return b > 1 ? (a + b - 1) / b : a;
+-}
+-
+-static uint32_t
+-sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+-{
+-	uint64_t row = (uint64_t)sweet_div_up(width, ew) * bpe;
+-	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+-}
+-
+-/* Geometry from the creation properties (IOSurface.h keys). */
+-static IOReturn
+-sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+-{
+-	uint64_t end;
+-
+-	s->width = sweet_dict_u32(props, "IOSurfaceWidth", 0);
+-	s->height = sweet_dict_u32(props, "IOSurfaceHeight", 0);
+-	s->bytesPerElement = (uint16_t)sweet_dict_u32(props, "IOSurfaceBytesPerElement", 4);
+-	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+-	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+-	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
+-	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+-	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+-	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+-	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+-		return kIOReturnBadArgument;
+-	}
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
+-	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+-		return kIOReturnBadArgument;
+-	}
+-	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+-
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+-	s->planeCount = 0;
+-	if (planes != NULL) {
+-		uint64_t next = s->offset;
+-		if (planes->getCount() > SWEET_SURFACE_MAX_PLANES) {
+-			return kIOReturnBadArgument;
+-		}
+-		for (unsigned int i = 0; i < planes->getCount(); i++) {
+-			OSDictionary *pd = OSDynamicCast(OSDictionary, planes->getObject(i));
+-			struct sweet_surface_plane *p = &s->planes[i];
+-			if (pd == NULL) {
+-				return kIOReturnBadArgument;
+-			}
+-			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
+-			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
+-			p->bytesPerElement = (uint16_t)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement", 1);
+-			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
+-			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
+-			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
+-			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
+-				return kIOReturnBadArgument;
+-			}
+-			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+-			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
+-			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+-			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+-			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
+-			next = round_page((uint64_t)p->offset + p->size);
+-			if ((uint64_t)p->offset + p->size > end) {
+-				end = (uint64_t)p->offset + p->size;
+-			}
+-		}
+-		s->planeCount = planes->getCount();
+-	}
+-
+-	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+-	if (alloc < end) {
+-		alloc = end;
+-	}
+-	alloc = round_page(alloc);
+-	if (alloc == 0 || alloc > SWEET_SURFACE_MAX_ALLOC) {
+-		return kIOReturnNoMemory;
+-	}
+-	s->allocSize = (uint32_t)alloc;
+-	return kIOReturnSuccess;
+-}
+-
+-/* Per-client mapping of one surface. */
+-class SweetSurfaceRef : public OSObject {
+-	OSDeclareDefaultStructors(SweetSurfaceRef);
+-
+-public:
+-	SweetSurface *surface;
+-	IOMemoryMap  *data;
+-	IOMemoryMap  *state;
+-	uint32_t      count;
+-
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+-	void free() APPLE_KEXT_OVERRIDE;
+-};
+-
+-OSDefineMetaClassAndStructors(SweetSurfaceRef, OSObject);
+-
+-void
+-SweetSurfaceRef::free()
+-{
+-	OSSafeReleaseNULL(data);
+-	OSSafeReleaseNULL(state);
+-	if (surface != NULL) {
+-		sweet_surface_put(surface);
+-		surface->release();
+-		surface = NULL;
+-	}
+-	OSObject::free();
+-}
+-
+-class IOCoreSurfaceRoot : public IOService {
+-	OSDeclareDefaultStructors(IOCoreSurfaceRoot);
+-
+-public:
+-	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-};
+-
+-OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
+-
+-bool
+-IOCoreSurfaceRoot::start(IOService *provider)
+-{
+-	if (!IOService::start(provider)) {
+-		return false;
+-	}
+-	sweet_surface_init_lock();
+-	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+-	registerService();
+-	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+-	return true;
+-}
+-
+-class IOSurfaceRootUserClient : public IOUserClient {
+-	OSDeclareDefaultStructors(IOSurfaceRootUserClient);
+-
+-	task_t   fTask;
+-	IOLock  *fLock;
+-	OSArray *fRefs;
+-
+-	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
+-	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+-	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+-	IOReturn create(IOExternalMethodArguments *args);
+-
+-public:
+-	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+-	void free() APPLE_KEXT_OVERRIDE;
+-	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+-	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+-	    IOExternalMethodDispatch *dispatch, OSObject *target,
+-	    void *reference) APPLE_KEXT_OVERRIDE;
+-	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+-
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
+-	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+-	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+-	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+-};
+-
+-OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+-
+-static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
+-
+-static void
+-sweet_surf_log_once(const char *what, uint32_t n)
+-{
+-	uint32_t bit = (what[0] == 't' ? 48 : 0) + n;
+-	if (bit >= 64 || (sweet_surf_logged & (1ULL << bit))) {
+-		return;
+-	}
+-	sweet_surf_logged |= 1ULL << bit;
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
+-}
+-
+-bool
+-IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+-{
+-	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+-		return false;
+-	}
+-	fTask = owningTask;
+-	fLock = IOLockAlloc();
+-	fRefs = OSArray::withCapacity(16);
+-	return fLock != NULL && fRefs != NULL;
+-}
+-
+-void
+-IOSurfaceRootUserClient::free()
+-{
+-	OSSafeReleaseNULL(fRefs);
+-	if (fLock != NULL) {
+-		IOLockFree(fLock);
+-		fLock = NULL;
+-	}
+-	IOUserClient::free();
+-}
+-
+-IOReturn
+-IOSurfaceRootUserClient::clientClose(void)
+-{
+-	IOLockLock(fLock);
+-	fRefs->flushCollection();
+-	IOLockUnlock(fLock);
+-	terminate();
+-	return kIOReturnSuccess;
+-}
+-
+-/* Lock held. */
+-SweetSurfaceRef *
+-IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
+-{
+-	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+-		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
+-			if (index != NULL) {
+-				*index = i;
+-			}
+-			return ref;
+-		}
+-	}
+-	return NULL;
+-}
+-
+-/*
+- * Count one more create/lookup of s by this client, mapping it into the
+- * task the first time. Takes over the caller's user count on s.
+- *
+- * A lookup of a surface this client already has maps nothing and counts
+- * nothing (*existing): IOSurface.framework then gets base address -1 in the
+- * lock result and reuses its cached IOSurfaceClient. Counting it instead
+- * made the framework build a second client for the same id; releasing that
+- * one (traps 4 + 5) unmapped the memory under the first (backboardd
+- * snapshot crash in CGDataProviderCreateWithData).
+- */
+-IOReturn
+-IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing)
+-{
+-	*existing = false;
+-	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef(s->id, NULL);
+-	if (ref != NULL && ref->surface == s) {
+-		IOLockUnlock(fLock);
+-		sweet_surface_put(s);
+-		*refOut = ref;
+-		*existing = true;
+-		return kIOReturnSuccess;
+-	}
+-	IOLockUnlock(fLock);
+-
+-	ref = OSTypeAlloc(SweetSurfaceRef);
+-	if (ref == NULL || !ref->init()) {
+-		OSSafeReleaseNULL(ref);
+-		sweet_surface_put(s);
+-		return kIOReturnNoMemory;
+-	}
+-	s->retain();
+-	ref->surface = s;
+-	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
+-	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+-	if (ref->data == NULL || ref->state == NULL) {
+-		ref->release();
+-		return kIOReturnVMError;
+-	}
+-	IOLockLock(fLock);
+-	SweetSurfaceRef *raced = findRef(s->id, NULL);
+-	if (raced != NULL && raced->surface == s) {
+-		/* Another thread mapped it meanwhile: count there, drop ours. */
+-		raced->count++;
+-		IOLockUnlock(fLock);
+-		ref->release();
+-		*refOut = raced;
+-		return kIOReturnSuccess;
+-	}
+-	fRefs->setObject(ref);
+-	IOLockUnlock(fLock);
+-	ref->release();         /* fRefs holds it */
+-	*refOut = ref;
+-	return kIOReturnSuccess;
+-}
+-
+-static void
+-put32(uint8_t *p, uint32_t off, uint32_t v)
+-{
+-	memcpy(p + off, &v, 4);
+-}
+-
+-static void
+-put64(uint8_t *p, uint32_t off, uint64_t v)
+-{
+-	memcpy(p + off, &v, 8);
+-}
+-
+-/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
+-static void
+-sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+-{
+-	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
+-	put64(out, 0x08, ref->state->getAddress());
+-	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+-	put32(out, 0x18, s->id);
+-	put32(out, 0x1c, s->allocSize);
+-	put32(out, 0x20, s->width);
+-	put32(out, 0x24, s->height);
+-	put32(out, 0x28, s->bytesPerRow);
+-	put32(out, 0x2c, s->offset);
+-	put32(out, 0x30, s->pixelFormat);
+-	put32(out, 0x34, s->allocSize);
+-	put32(out, 0x38, s->planeCount);
+-	memcpy(out + 0x40, &s->bytesPerElement, 2);
+-	out[0x42] = s->elementWidth;
+-	out[0x43] = s->elementHeight;
+-	put32(out, 0x44, s->cacheMode);
+-	put32(out, 0x50, s->parentID);
+-	put32(out, 0x54, 1);
+-	for (uint32_t i = 0; i < s->planeCount; i++) {
+-		uint8_t *p = out + 0x68 + i * 0x80;
+-		const struct sweet_surface_plane *pl = &s->planes[i];
+-		put32(p, 0x00, pl->width);
+-		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+-		put32(p, 0x0c, pl->offset);
+-		put32(p, 0x14, pl->size);
+-		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+-		p[0x1a] = pl->elementWidth;
+-		p[0x1b] = pl->elementHeight;
+-	}
+-}
+-
+-static IOReturn
+-sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+-{
+-	if (args->structureOutputDescriptor != NULL) {
+-		if (len > args->structureOutputDescriptor->getLength()) {
+-			return kIOReturnNoSpace;
+-		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
+-		args->structureOutputDescriptorSize = len;
+-		return kIOReturnSuccess;
+-	}
+-	if (args->structureOutput == NULL || len > args->structureOutputSize) {
+-		return kIOReturnNoSpace;
+-	}
+-	memcpy(args->structureOutput, buf, len);
+-	args->structureOutputSize = len;
+-	return kIOReturnSuccess;
+-}
+-
+-/* Map s for this client and answer with its lock result. Takes s's user count. */
+-IOReturn
+-IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
+-{
+-	SweetSurfaceRef *ref = NULL;
+-	bool existing = false;
+-	IOReturn ret = addRef(s, &ref, &existing);
+-	if (ret != kIOReturnSuccess) {
+-		return ret;
+-	}
+-	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
+-	if (out == NULL) {
+-		ret = kIOReturnNoMemory;
+-	} else {
+-		sweet_surface_fill_result(s, ref, out);
+-		if (existing) {
+-			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
+-		}
+-		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
+-		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
+-	}
+-	if (ret != kIOReturnSuccess && !existing) {
+-		/* The caller never learns the id: undo this create/lookup. */
+-		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+-	}
+-	return ret;
+-}
+-
+-IOReturn
+-IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+-{
+-	const char *buf = (const char *)args->structureInput;
+-	uint32_t len = args->structureInputSize;
+-	char *copy = NULL;
+-	IOReturn ret;
+-
+-	if (args->structureInputDescriptor != NULL) {
+-		len = (uint32_t)args->structureInputDescriptor->getLength();
+-		if (len == 0 || len > SWEET_SURFACE_MAX_PROPS) {
+-			return kIOReturnBadArgument;
+-		}
+-		copy = (char *)IOMallocData(len);
+-		if (copy == NULL) {
+-			return kIOReturnNoMemory;
+-		}
+-		args->structureInputDescriptor->readBytes(0, copy, len);
+-		buf = copy;
+-	}
+-	OSObject *obj = (buf != NULL && len > 0) ? OSUnserializeXML(buf, len) : NULL;
+-	if (copy != NULL) {
+-		IOFreeData(copy, len);
+-	}
+-	OSDictionary *props = OSDynamicCast(OSDictionary, obj);
+-	if (props == NULL) {
+-		OSSafeReleaseNULL(obj);
+-		IOLog("SWEET SURF: create: bad property dictionary (%u bytes)\n", len);
+-		return kIOReturnBadArgument;
+-	}
+-
+-	SweetSurface *s = sweet_surface_alloc();
+-	if (s == NULL) {
+-		props->release();
+-		return kIOReturnNoMemory;
+-	}
+-	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+-	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
+-		IOMemoryDescriptor *mem = NULL;
+-		uint64_t splash_pa = 0;
+-		bool splash = false;
+-
+-		/*
+-		 * Full-screen layers: prefer the ABL splash carve-out the DPU
+-		 * already scans (zero-copy flip). Else normal wired pages.
+-		 * Contiguous DRAM only as a last resort when sweetfb_flip=1.
+-		 */
+-		mem = sweet_surface_splash_alloc(s, &splash_pa);
+-		if (mem != NULL) {
+-			splash = true;
+-			s->physAddr = splash_pa;
+-			s->mapCache = kIOMapCopybackCache;
+-			/* Splash RAM is not charged to the wired budget. */
+-		} else if ((uint64_t)OSAddAtomic64(s->allocSize,
+-		    (volatile SInt64 *)&sweet_surface_wired) + s->allocSize <=
+-		    SWEET_SURFACE_WIRED_MAX) {
+-			IOBufferMemoryDescriptor *buf = NULL;
+-			if (sweet_surface_want_contig(s)) {
+-				buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared |
+-				    kIOMemoryPhysicallyContiguous,
+-				    s->allocSize, 0x00000000ffffffffull);
+-			}
+-			if (buf == NULL) {
+-				buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared,
+-				    s->allocSize, page_size);
+-			}
+-			mem = buf;
+-			if (mem == NULL) {
+-				OSAddAtomic64(-(SInt64)s->allocSize,
+-				    (volatile SInt64 *)&sweet_surface_wired);
+-			}
+-		}
+-		if (mem == NULL) {
+-			ret = kIOReturnNoMemory;
+-		} else {
+-			if (!splash) {
+-				IOBufferMemoryDescriptor *buf =
+-				    OSDynamicCast(IOBufferMemoryDescriptor, mem);
+-				if (buf != NULL) {
+-					bzero(buf->getBytesNoCopy(), s->allocSize);
+-				}
+-				s->mapCache = kIOMapDefaultCache;
+-			}
+-			s->memory = mem;
+-			if (!splash && sweet_surface_want_contig(s)) {
+-				sweet_surface_capture_phys(s);
+-			}
+-			if (!sweet_surface_publish(s)) {
+-				ret = kIOReturnNoResources;
+-			}
+-		}
+-	}
+-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 16) {
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+-		sweet_surface_creates_logged++;
+-		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u "
+-		    "phys 0x%llx keys %u -> 0x%x\n",
+-		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize,
+-		    (unsigned long long)s->physAddr, props->getCount(), ret);
+-	}
+-	props->release();
+-	if (ret != kIOReturnSuccess) {
+-		s->release();
+-		return ret;
+-	}
+-	ret = returnSurface(s, args);   /* takes the creator's user count */
+-	s->release();
+-	return ret;
+-}
+-
+-IOReturn
+-IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+-    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+-    __unused void *reference)
+-{
+-	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
+-
+-	switch (selector) {
+-	case kSweetSurfaceLimits: {
+-		uint8_t limits[0x18] = { 0 };
+-		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
+-		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
+-		limits[0x16] = 1;
+-		sweet_surf_log_once("sel", selector);
+-		return sweet_struct_out(args, limits, sizeof(limits));
+-	}
+-	case kSweetSurfaceCreate:
+-		return create(args);
+-	case kSweetSurfaceLookup: {
+-		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+-		IOReturn ret = kIOReturnNotFound;
+-		if (s != NULL) {
+-			ret = sweet_surface_get(s) ? returnSurface(s, args) : kIOReturnNotFound;
+-			s->release();
+-		}
+-		sweet_surf_log_once("sel", selector);
+-		return ret;
+-	}
+-	case kSweetSurfaceLookupFromPort: {
+-		OSObject *obj = NULL;
+-		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
+-		SweetSurface *s = OSDynamicCast(SweetSurface, obj);
+-		if (ret == kIOReturnSuccess) {
+-			ret = (s != NULL && sweet_surface_get(s)) ? returnSurface(s, args) : kIOReturnBadArgument;
+-		}
+-		OSSafeReleaseNULL(obj);
+-		sweet_surf_log_once("sel", selector);
+-		return ret;
+-	}
+-	case kSweetSurfaceCreatePort: {
+-		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+-		if (s == NULL || args->scalarOutputCount < 1) {
+-			OSSafeReleaseNULL(s);
+-			return kIOReturnNotFound;
+-		}
+-		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
+-		args->scalarOutputCount = 1;
+-		s->release();
+-		sweet_surf_log_once("sel", selector);
+-		return kIOReturnSuccess;
+-	}
+-	default:
+-		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+-		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+-			args->scalarOutput[i] = 0;
+-		}
+-		if (args->structureOutput != NULL) {
+-			bzero(args->structureOutput, args->structureOutputSize);
+-		}
+-		sweet_surf_log_once("sel", selector);
+-		return kIOReturnSuccess;
+-	}
+-}
+-
+-IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
+-{
+-	return kIOReturnSuccess;
+-}
+-
+-static IOReturn
+-sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+-{
+-	uint32_t seed = bump ? OSIncrementAtomic((volatile SInt32 *)sweet_surface_seed(s)) + 1 :
+-	    *sweet_surface_seed(s);
+-	if (seedOut != NULL && copyout(&seed, (user_addr_t)seedOut, sizeof(seed)) != 0) {
+-		return kIOReturnBadArgument;
+-	}
+-	return kIOReturnSuccess;
+-}
+-
+-/* Retained surface this client created or looked up, or NULL. */
+-static SweetSurface *
+-sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+-{
+-	SweetSurface *s = NULL;
+-	IOLockLock(lock);
+-	for (unsigned int i = 0; i < refs->getCount(); i++) {
+-		SweetSurfaceRef *ref = (SweetSurfaceRef *)refs->getObject(i);
+-		if (ref->surface->id == id) {
+-			s = ref->surface;
+-			s->retain();
+-			break;
+-		}
+-	}
+-	IOLockUnlock(lock);
+-	return s;
+-}
+-
+-IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+-    void *, void *, void *)
+-{
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+-	if (s == NULL) {
+-		return kIOReturnNotFound;
+-	}
+-	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+-	s->release();
+-	return ret;
+-}
+-
+-IOReturn
+-IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+-    void *, void *, void *)
+-{
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+-	if (s == NULL) {
+-		return kIOReturnNotFound;
+-	}
+-	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+-	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+-	s->release();
+-	return ret;
+-}
+-
+-IOReturn
+-IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+-{
+-	unsigned int index;
+-	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
+-	if (ref != NULL && --ref->count == 0) {
+-		fRefs->removeObject(index);     /* unmaps and drops the user count */
+-	}
+-	IOLockUnlock(fLock);
+-	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+-}
+-
+-static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+-	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+-	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-};
+-
+-IOExternalTrap *
+-IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
+-{
+-	if (index >= sizeof(sweet_surface_traps) / sizeof(sweet_surface_traps[0])) {
+-		sweet_surf_log_once("trap", index);
+-		return NULL;
+-	}
+-	sweet_surf_log_once("trap", index);
+-	*targetP = this;
+-	return &sweet_surface_traps[index];
+-}
+-#endif /* SWEET */
++/*
++ * Built-in IOSurface for SWEET.
++ *
++ * Apple's IOSurface kext is closed. IOSurface.framework (iOS 16.7) finds
++ * IOServiceNameMatching("IOCoreSurfaceRoot"), opens it with type 0 and
++ * talks to the user client below:
++ *
++ *   sel 13  limits: struct out 0x18, u16 at +0x16 must be 1 (ABI version),
++ *           +0 offset alignment mask, +4 bytes-per-row alignment mask
++ *   sel 0   create: scalar [parent id], struct in = serialized property
++ *           dictionary (binary or XML), struct out = lock result (0xa68)
++ *   sel 4   lookup by id: scalar [id], struct out = lock result
++ *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
++ *   sel 35  create mach port: scalars [id, options], scalar out [port name]
++ *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
++ *           (id, options, &seed), 4/5 release (id)
++ *
++ * The lock result tells the library where the surface lives in the
++ * caller's address space: +0 pixels, +8 shared state page (registry id,
++ * seed at +0xc), +0x10 timestamps, then id, sizes and geometry (layout in
++ * sweet_surface_fill_result). Every surface is wired kernel memory mapped
++ * into each task that creates or looks it up; mappings are counted per
++ * client and dropped on release or close.
++ *
++ * Values, notifications, accelerators and shared events are accepted and
++ * ignored (logged once per selector).
++ */
++#include "SweetSurface.h"
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/system.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSUnserialize.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++enum {
++	kSweetSurfaceCreate             = 0,
++	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceLimits             = 13,
++	kSweetSurfaceLookupFromPort     = 34,
++	kSweetSurfaceCreatePort         = 35,
++};
++
++enum {
++	kSweetSurfaceTrapIncrementUse   = 0,
++	kSweetSurfaceTrapDecrementUse   = 1,
++	kSweetSurfaceTrapLock           = 2,
++	kSweetSurfaceTrapUnlock         = 3,
++	kSweetSurfaceTrapRelease        = 4,
++	kSweetSurfaceTrapReleaseFailed  = 5,
++};
++
++#define SWEET_SURFACE_RESULT_SIZE       0xa68
++#define SWEET_SURFACE_MAX_ID            4096
++#define SWEET_SURFACE_MAX_DIM           16384
++#define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
++#define SWEET_SURFACE_MAX_PROPS         (64u << 10)
++#define SWEET_SURFACE_ROW_ALIGN         64
++#define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
++#define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++#define kIOSurfaceLockReadOnly          0x1
++
++static IOLock       *sweet_surface_lock;
++static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
++static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
++static uint32_t      sweet_surface_next_id = 1;
++static uint32_t      sweet_surface_creates_logged;
++static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++#define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++
++/*
++ * Flip pool: physically contiguous buffers below 4 GB, so every full-screen
++ * layer CoreAnimation rotates through can be scanned out. The ABL carve-out
++ * is only large enough for one CA-sized slot; the second surface used to land
++ * on wired pages the DPU cannot address, so every other frame fell back to a
++ * CPU copy (and the panel froze on the flipped one).
++ */
++#define SWEET_FLIP_SLOTS        4
++static struct {
++	IOBufferMemoryDescriptor *md;
++	uint64_t                  pa;
++} g_flip[SWEET_FLIP_SLOTS];
++static uint32_t g_flip_count;    /* slots reserved by sweet_surface_flip_pool */
++static uint32_t g_flip_bytes;    /* size of one slot */
++static uint32_t g_flip_used;     /* bit i = slot i handed to a surface */
++
++OSDefineMetaClassAndStructors(SweetSurface, OSObject);
++
++void
++SweetSurface::free()
++{
++	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
++		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	}
++	if (poolIdx < SWEET_FLIP_SLOTS && sweet_surface_lock != NULL) {
++		/* Give the slot back: compositors recreate surfaces on mode
++		 * changes and a leaked slot would silently cost a flip later. */
++		IOLockLock(sweet_surface_lock);
++		g_flip_used &= ~(1u << poolIdx);
++		IOLockUnlock(sweet_surface_lock);
++	}
++	poolIdx = ~0u;
++	OSSafeReleaseNULL(kernelMap);
++	OSSafeReleaseNULL(memory);
++	OSSafeReleaseNULL(state);
++	OSObject::free();
++}
++
++uintptr_t
++SweetSurface::kernelAddress()
++{
++	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, memory);
++	if (buffer != NULL) {
++		return (uintptr_t)buffer->getBytesNoCopy();
++	}
++	IOLockLock(sweet_surface_lock);
++	if (kernelMap == NULL && memory != NULL) {
++		/* Splash / physical surfaces: honour mapCache (copyback for DPU flip). */
++		kernelMap = memory->map(mapCache != 0 ? mapCache : kIOMapWriteCombineCache);
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
++}
++
++static uint32_t *
++sweet_surface_seed(SweetSurface *s)
++{
++	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
++}
++
++/*
++ * Give the surface an id and a table slot; the table holds one retain and a
++ * user count (creators, client mappings, kernel holders). Lock held.
++ */
++static bool
++sweet_surface_insert_locked(SweetSurface *s)
++{
++	for (uint32_t n = 0; n < SWEET_SURFACE_MAX_ID - 1; n++) {
++		uint32_t id = sweet_surface_next_id;
++		sweet_surface_next_id = id + 1 < SWEET_SURFACE_MAX_ID ? id + 1 : 1;
++		if (sweet_surface_table[id] == NULL) {
++			s->id = id;
++			s->retain();
++			sweet_surface_table[id] = s;
++			sweet_surface_users[id] = 1;
++			*(uint64_t *)s->state->getBytesNoCopy() = id;   /* registry id */
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Add a user to a surface that may have left the table (port lookups). */
++static bool
++sweet_surface_get(SweetSurface *s)
++{
++	bool ok = true;
++	IOLockLock(sweet_surface_lock);
++	if (sweet_surface_table[s->id] == s) {
++		sweet_surface_users[s->id]++;
++	} else if (sweet_surface_table[s->id] == NULL) {
++		s->retain();
++		sweet_surface_table[s->id] = s;
++		sweet_surface_users[s->id] = 1;
++	} else {
++		ok = false;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return ok;
++}
++
++/* Drop a user; the last one removes the surface from the table. */
++static void
++sweet_surface_put(SweetSurface *s)
++{
++	bool drop = false;
++	IOLockLock(sweet_surface_lock);
++	if (sweet_surface_table[s->id] == s && --sweet_surface_users[s->id] == 0) {
++		sweet_surface_table[s->id] = NULL;
++		drop = true;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	if (drop) {
++		s->release();
++	}
++}
++
++SweetSurface *
++sweet_surface_copy(uint32_t id)
++{
++	SweetSurface *s = NULL;
++	if (id == 0 || id >= SWEET_SURFACE_MAX_ID || sweet_surface_lock == NULL) {
++		return NULL;
++	}
++	IOLockLock(sweet_surface_lock);
++	s = sweet_surface_table[id];
++	if (s != NULL) {
++		s->retain();
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return s;
++}
++
++/* The table lock; the framebuffer may publish a surface before the root starts. */
++static void
++sweet_surface_init_lock(void)
++{
++	if (sweet_surface_lock == NULL) {
++		IOLock *lock = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, lock, &sweet_surface_lock)) {
++			IOLockFree(lock);
++		}
++	}
++}
++
++static SweetSurface *
++sweet_surface_alloc(void)
++{
++	sweet_surface_init_lock();
++	SweetSurface *s = OSTypeAlloc(SweetSurface);
++	if (s == NULL || !s->init()) {
++		OSSafeReleaseNULL(s);
++		return NULL;
++	}
++	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	if (s->state == NULL) {
++		s->release();
++		return NULL;
++	}
++	bzero(s->state->getBytesNoCopy(), page_size);
++	s->poolIdx = ~0u;
++	return s;
++}
++
++static bool
++sweet_surface_publish(SweetSurface *s)
++{
++	bool ok;
++	IOLockLock(sweet_surface_lock);
++	ok = sweet_surface_insert_locked(s);
++	IOLockUnlock(sweet_surface_lock);
++	return ok;
++}
++
++#define SWEET_SPLASH_SLOTS      3
++
++static struct {
++	uint64_t phys;
++	uint32_t region;
++	uint32_t slot;
++	uint32_t used;          /* bit i = slot i taken (slot 0 = panel) */
++	int      enabled;
++} g_splash;
++
++void
++sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
++    uint32_t slot_bytes)
++{
++	int on = 1;
++
++	PE_parse_boot_argn("sweetfb_splash", &on, sizeof(on));
++	g_splash.enabled = 0;
++	g_splash.phys = 0;
++	g_splash.region = 0;
++	g_splash.slot = 0;
++	g_splash.used = 0;
++	if (on <= 0 || phys == 0 || region_bytes < slot_bytes * 2 || slot_bytes == 0) {
++		IOLog("SWEET SURF: splash pool off\n");
++		return;
++	}
++	slot_bytes = (uint32_t)round_page(slot_bytes);
++	if (slot_bytes * 2 > region_bytes) {
++		IOLog("SWEET SURF: splash region too small for 2 slots\n");
++		return;
++	}
++	g_splash.phys = phys;
++	g_splash.region = region_bytes;
++	g_splash.slot = slot_bytes;
++	g_splash.used = 1u;     /* slot 0 = panel framebuffer */
++	g_splash.enabled = 1;
++	IOLog("SWEET SURF: splash pool pa 0x%llx region %u slot %u (%u CA slots)\n",
++	    (unsigned long long)phys, region_bytes, slot_bytes,
++	    region_bytes / slot_bytes - 1);
++}
++
++/*
++ * Reserve physically contiguous slot_bytes buffers below 4 GB. A single big
++ * request is more likely to succeed than a later one, and the pool has to be
++ * ready before CoreAnimation creates its surfaces, so this runs in start().
++ */
++uint32_t
++sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count)
++{
++	int flip = 0;
++
++	if (g_flip_count != 0 || slot_bytes == 0 || count == 0) {
++		return g_flip_count;
++	}
++	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
++	if (flip <= 0) {
++		IOLog("SWEET SURF: flip pool off (sweetfb_flip=0)\n");
++		return 0;
++	}
++	if (count > SWEET_FLIP_SLOTS) {
++		count = SWEET_FLIP_SLOTS;
++	}
++	slot_bytes = (uint32_t)round_page(slot_bytes);
++	for (uint32_t i = 0; i < count; i++) {
++		IOBufferMemoryDescriptor *md =
++		    IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared |
++		    kIOMemoryPhysicallyContiguous, slot_bytes, 0x00000000ffffffffull);
++		IOByteCount len = 0;
++		addr64_t pa = md != NULL ? md->getPhysicalSegment(0, &len) : 0;
++
++		if (md == NULL || pa == 0 || len < slot_bytes ||
++		    pa > 0xffffffffull || pa + slot_bytes > 0x100000000ull) {
++			IOLog("SWEET SURF: flip pool slot %u of %u bytes: %s\n", i,
++			    slot_bytes, md == NULL ? "contiguous alloc failed" :
++			    "not below 4 GB");
++			OSSafeReleaseNULL(md);
++			break;
++		}
++		g_flip[i].md = md;
++		g_flip[i].pa = pa;
++		g_flip_count++;
++		IOLog("SWEET SURF: flip pool %u pa 0x%llx %u bytes\n", i,
++		    (unsigned long long)pa, slot_bytes);
++	}
++	g_flip_bytes = slot_bytes;
++	IOLog("SWEET SURF: flip pool %u slots of %u bytes (%u KB wired) -> "
++	    "%s\n", g_flip_count, slot_bytes, (g_flip_count * slot_bytes) / 1024u,
++	    g_flip_count != 0 ? "every CA layer can flip" : "splash slot only");
++	return g_flip_count;
++}
++
++static bool
++sweet_surface_is_display_layer(SweetSurface *s)
++{
++	if (s == NULL) {
++		return false;
++	}
++	if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
++		return false;
++	}
++	if (s->width < 720 || s->height < 1280 || s->allocSize < (2u << 20)) {
++		return false;
++	}
++	return true;
++}
++
++/*
++ * Prefer a splash slot (DPU already scans this RAM). Falls back to contiguous
++ * DRAM only when sweetfb_flip=1 and splash is exhausted/off.
++ */
++static bool
++sweet_surface_want_contig(SweetSurface *s)
++{
++	static int flip = -1;
++
++	if (flip < 0) {
++		flip = 0;
++		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
++	}
++	return flip > 0 && sweet_surface_is_display_layer(s);
++}
++
++static IOMemoryDescriptor *
++sweet_surface_splash_alloc(SweetSurface *s, uint64_t *out_pa)
++{
++	uint32_t i, n;
++	uint64_t pa;
++
++	*out_pa = 0;
++	if (!g_splash.enabled || !sweet_surface_is_display_layer(s)) {
++		return NULL;
++	}
++	if (s->allocSize > g_splash.slot) {
++		return NULL;
++	}
++	n = g_splash.region / g_splash.slot;
++	if (n > SWEET_SPLASH_SLOTS) {
++		n = SWEET_SPLASH_SLOTS;
++	}
++	for (i = 1; i < n; i++) {
++		if (g_splash.used & (1u << i)) {
++			continue;
++		}
++		pa = g_splash.phys + (uint64_t)i * g_splash.slot;
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa,
++		    s->allocSize, kIODirectionInOut);
++		if (md == NULL) {
++			return NULL;
++		}
++		g_splash.used |= (1u << i);
++		*out_pa = pa;
++		IOLog("SWEET SURF: splash slot %u pa 0x%llx size %u\n",
++		    i, (unsigned long long)pa, s->allocSize);
++		return md;
++	}
++	return NULL;
++}
++
++/*
++ * A reserved flip-pool slot for a full-screen layer, or NULL. Preferred over
++ * the splash slot: it is the only way to keep every surface of a rotating
++ * compositor flippable.
++ */
++static IOMemoryDescriptor *
++sweet_surface_pool_alloc(SweetSurface *s, uint64_t *out_pa, uint32_t *out_idx)
++{
++	uint32_t i;
++
++	*out_pa = 0;
++	*out_idx = ~0u;
++	if (g_flip_count == 0 || !sweet_surface_is_display_layer(s) ||
++	    s->allocSize > g_flip_bytes) {
++		return NULL;
++	}
++	IOLockLock(sweet_surface_lock);
++	for (i = 0; i < g_flip_count; i++) {
++		if (g_flip_used & (1u << i)) {
++			continue;
++		}
++		g_flip_used |= 1u << i;
++		g_flip[i].md->retain();        /* held by the pool and the surface */
++		*out_pa = g_flip[i].pa;
++		*out_idx = i;
++		IOLockUnlock(sweet_surface_lock);
++		IOLog("SWEET SURF: flip slot %u pa 0x%llx size %u\n", i,
++		    (unsigned long long)*out_pa, s->allocSize);
++		return g_flip[i].md;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return NULL;
++}
++
++/*
++ * Record the PA when the descriptor is a single contiguous segment below 4 GB
++ * (the DPU address path the bootloader left is 32-bit, SMMU bypassed).
++ */
++static void
++sweet_surface_capture_phys(SweetSurface *s)
++{
++	IOByteCount len = 0;
++	addr64_t pa;
++
++	s->physAddr = 0;
++	if (s->memory == NULL || s->allocSize == 0) {
++		return;
++	}
++	pa = s->memory->getPhysicalSegment(0, &len);
++	if (pa == 0 || len < s->allocSize || pa > 0xffffffffull ||
++	    (pa + s->allocSize) > 0x100000000ull) {
++		return;
++	}
++	s->physAddr = pa;
++}
++
++uint64_t
++sweet_surface_phys(SweetSurface *s)
++{
++	if (s == NULL || s->physAddr == 0) {
++		return 0;
++	}
++	return s->physAddr + s->offset;
++}
++
++SweetSurface *
++sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
++	s->mapCache = kIOMapWriteCombineCache;
++	s->physAddr = (phys != 0 && phys <= 0xffffffffull) ? phys : 0;
++	if (s->memory == NULL || !sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
++mach_port_name_t
++sweet_surface_port_in_task(SweetSurface *s, task_t task)
++{
++	mach_port_name_t name = 0;
++	IOUserClient::copyPortNameForObjectInTask(task, s, &name);
++	return name;
++}
++
++static uint32_t
++sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, dict->getObject(key));
++	return n != NULL ? n->unsigned32BitValue() : def;
++}
++
++static uint32_t
++sweet_div_up(uint32_t a, uint32_t b)
++{
++	return b > 1 ? (a + b - 1) / b : a;
++}
++
++static uint32_t
++sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
++{
++	uint64_t row = (uint64_t)sweet_div_up(width, ew) * bpe;
++	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++}
++
++/* Geometry from the creation properties (IOSurface.h keys). */
++static IOReturn
++sweet_surface_layout(SweetSurface *s, OSDictionary *props)
++{
++	uint64_t end;
++
++	s->width = sweet_dict_u32(props, "IOSurfaceWidth", 0);
++	s->height = sweet_dict_u32(props, "IOSurfaceHeight", 0);
++	s->bytesPerElement = (uint16_t)sweet_dict_u32(props, "IOSurfaceBytesPerElement", 4);
++	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
++	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
++	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
++	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
++	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
++	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
++		return kIOReturnBadArgument;
++	}
++	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
++	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
++		return kIOReturnBadArgument;
++	}
++	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++
++	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	s->planeCount = 0;
++	if (planes != NULL) {
++		uint64_t next = s->offset;
++		if (planes->getCount() > SWEET_SURFACE_MAX_PLANES) {
++			return kIOReturnBadArgument;
++		}
++		for (unsigned int i = 0; i < planes->getCount(); i++) {
++			OSDictionary *pd = OSDynamicCast(OSDictionary, planes->getObject(i));
++			struct sweet_surface_plane *p = &s->planes[i];
++			if (pd == NULL) {
++				return kIOReturnBadArgument;
++			}
++			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
++			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
++			p->bytesPerElement = (uint16_t)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement", 1);
++			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
++			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
++			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
++			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
++				return kIOReturnBadArgument;
++			}
++			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
++			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
++			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
++			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
++			next = round_page((uint64_t)p->offset + p->size);
++			if ((uint64_t)p->offset + p->size > end) {
++				end = (uint64_t)p->offset + p->size;
++			}
++		}
++		s->planeCount = planes->getCount();
++	}
++
++	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++	if (alloc < end) {
++		alloc = end;
++	}
++	alloc = round_page(alloc);
++	if (alloc == 0 || alloc > SWEET_SURFACE_MAX_ALLOC) {
++		return kIOReturnNoMemory;
++	}
++	s->allocSize = (uint32_t)alloc;
++	return kIOReturnSuccess;
++}
++
++/* Per-client mapping of one surface. */
++class SweetSurfaceRef : public OSObject {
++	OSDeclareDefaultStructors(SweetSurfaceRef);
++
++public:
++	SweetSurface *surface;
++	IOMemoryMap  *data;
++	IOMemoryMap  *state;
++	uint32_t      count;
++
++	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	void free() APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetSurfaceRef, OSObject);
++
++void
++SweetSurfaceRef::free()
++{
++	OSSafeReleaseNULL(data);
++	OSSafeReleaseNULL(state);
++	if (surface != NULL) {
++		sweet_surface_put(surface);
++		surface->release();
++		surface = NULL;
++	}
++	OSObject::free();
++}
++
++class IOCoreSurfaceRoot : public IOService {
++	OSDeclareDefaultStructors(IOCoreSurfaceRoot);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
++
++bool
++IOCoreSurfaceRoot::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	sweet_surface_init_lock();
++	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
++	registerService();
++	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
++	return true;
++}
++
++class IOSurfaceRootUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOSurfaceRootUserClient);
++
++	task_t   fTask;
++	IOLock  *fLock;
++	OSArray *fRefs;
++
++	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
++	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
++	IOReturn create(IOExternalMethodArguments *args);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
++
++	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
++	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
++	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++};
++
++OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
++
++static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
++
++static void
++sweet_surf_log_once(const char *what, uint32_t n)
++{
++	uint32_t bit = (what[0] == 't' ? 48 : 0) + n;
++	if (bit >= 64 || (sweet_surf_logged & (1ULL << bit))) {
++		return;
++	}
++	sweet_surf_logged |= 1ULL << bit;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
++}
++
++bool
++IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fLock = IOLockAlloc();
++	fRefs = OSArray::withCapacity(16);
++	return fLock != NULL && fRefs != NULL;
++}
++
++void
++IOSurfaceRootUserClient::free()
++{
++	OSSafeReleaseNULL(fRefs);
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++IOSurfaceRootUserClient::clientClose(void)
++{
++	IOLockLock(fLock);
++	fRefs->flushCollection();
++	IOLockUnlock(fLock);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/* Lock held. */
++SweetSurfaceRef *
++IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++{
++	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
++		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
++		if (ref->surface->id == id) {
++			if (index != NULL) {
++				*index = i;
++			}
++			return ref;
++		}
++	}
++	return NULL;
++}
++
++/*
++ * Count one more create/lookup of s by this client, mapping it into the
++ * task the first time. Takes over the caller's user count on s.
++ *
++ * A lookup of a surface this client already has maps nothing and counts
++ * nothing (*existing): IOSurface.framework then gets base address -1 in the
++ * lock result and reuses its cached IOSurfaceClient. Counting it instead
++ * made the framework build a second client for the same id; releasing that
++ * one (traps 4 + 5) unmapped the memory under the first (backboardd
++ * snapshot crash in CGDataProviderCreateWithData).
++ */
++IOReturn
++IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing)
++{
++	*existing = false;
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef(s->id, NULL);
++	if (ref != NULL && ref->surface == s) {
++		IOLockUnlock(fLock);
++		sweet_surface_put(s);
++		*refOut = ref;
++		*existing = true;
++		return kIOReturnSuccess;
++	}
++	IOLockUnlock(fLock);
++
++	ref = OSTypeAlloc(SweetSurfaceRef);
++	if (ref == NULL || !ref->init()) {
++		OSSafeReleaseNULL(ref);
++		sweet_surface_put(s);
++		return kIOReturnNoMemory;
++	}
++	s->retain();
++	ref->surface = s;
++	ref->count = 1;
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
++	if (ref->data == NULL || ref->state == NULL) {
++		ref->release();
++		return kIOReturnVMError;
++	}
++	IOLockLock(fLock);
++	SweetSurfaceRef *raced = findRef(s->id, NULL);
++	if (raced != NULL && raced->surface == s) {
++		/* Another thread mapped it meanwhile: count there, drop ours. */
++		raced->count++;
++		IOLockUnlock(fLock);
++		ref->release();
++		*refOut = raced;
++		return kIOReturnSuccess;
++	}
++	fRefs->setObject(ref);
++	IOLockUnlock(fLock);
++	ref->release();         /* fRefs holds it */
++	*refOut = ref;
++	return kIOReturnSuccess;
++}
++
++static void
++put32(uint8_t *p, uint32_t off, uint32_t v)
++{
++	memcpy(p + off, &v, 4);
++}
++
++static void
++put64(uint8_t *p, uint32_t off, uint64_t v)
++{
++	memcpy(p + off, &v, 8);
++}
++
++/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
++static void
++sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
++{
++	bzero(out, SWEET_SURFACE_RESULT_SIZE);
++	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x08, ref->state->getAddress());
++	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
++	put32(out, 0x18, s->id);
++	put32(out, 0x1c, s->allocSize);
++	put32(out, 0x20, s->width);
++	put32(out, 0x24, s->height);
++	put32(out, 0x28, s->bytesPerRow);
++	put32(out, 0x2c, s->offset);
++	put32(out, 0x30, s->pixelFormat);
++	put32(out, 0x34, s->allocSize);
++	put32(out, 0x38, s->planeCount);
++	memcpy(out + 0x40, &s->bytesPerElement, 2);
++	out[0x42] = s->elementWidth;
++	out[0x43] = s->elementHeight;
++	put32(out, 0x44, s->cacheMode);
++	put32(out, 0x50, s->parentID);
++	put32(out, 0x54, 1);
++	for (uint32_t i = 0; i < s->planeCount; i++) {
++		uint8_t *p = out + 0x68 + i * 0x80;
++		const struct sweet_surface_plane *pl = &s->planes[i];
++		put32(p, 0x00, pl->width);
++		put32(p, 0x04, pl->height);
++		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x0c, pl->offset);
++		put32(p, 0x14, pl->size);
++		memcpy(p + 0x18, &pl->bytesPerElement, 2);
++		p[0x1a] = pl->elementWidth;
++		p[0x1b] = pl->elementHeight;
++	}
++}
++
++static IOReturn
++sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
++{
++	if (args->structureOutputDescriptor != NULL) {
++		if (len > args->structureOutputDescriptor->getLength()) {
++			return kIOReturnNoSpace;
++		}
++		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		args->structureOutputDescriptorSize = len;
++		return kIOReturnSuccess;
++	}
++	if (args->structureOutput == NULL || len > args->structureOutputSize) {
++		return kIOReturnNoSpace;
++	}
++	memcpy(args->structureOutput, buf, len);
++	args->structureOutputSize = len;
++	return kIOReturnSuccess;
++}
++
++/* Map s for this client and answer with its lock result. Takes s's user count. */
++IOReturn
++IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
++{
++	SweetSurfaceRef *ref = NULL;
++	bool existing = false;
++	IOReturn ret = addRef(s, &ref, &existing);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
++	if (out == NULL) {
++		ret = kIOReturnNoMemory;
++	} else {
++		sweet_surface_fill_result(s, ref, out);
++		if (existing) {
++			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
++		}
++		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
++		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
++	}
++	if (ret != kIOReturnSuccess && !existing) {
++		/* The caller never learns the id: undo this create/lookup. */
++		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
++	}
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
++{
++	const char *buf = (const char *)args->structureInput;
++	uint32_t len = args->structureInputSize;
++	char *copy = NULL;
++	IOReturn ret;
++
++	if (args->structureInputDescriptor != NULL) {
++		len = (uint32_t)args->structureInputDescriptor->getLength();
++		if (len == 0 || len > SWEET_SURFACE_MAX_PROPS) {
++			return kIOReturnBadArgument;
++		}
++		copy = (char *)IOMallocData(len);
++		if (copy == NULL) {
++			return kIOReturnNoMemory;
++		}
++		args->structureInputDescriptor->readBytes(0, copy, len);
++		buf = copy;
++	}
++	OSObject *obj = (buf != NULL && len > 0) ? OSUnserializeXML(buf, len) : NULL;
++	if (copy != NULL) {
++		IOFreeData(copy, len);
++	}
++	OSDictionary *props = OSDynamicCast(OSDictionary, obj);
++	if (props == NULL) {
++		OSSafeReleaseNULL(obj);
++		IOLog("SWEET SURF: create: bad property dictionary (%u bytes)\n", len);
++		return kIOReturnBadArgument;
++	}
++
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		props->release();
++		return kIOReturnNoMemory;
++	}
++	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++	ret = sweet_surface_layout(s, props);
++	if (ret == kIOReturnSuccess) {
++		IOMemoryDescriptor *mem = NULL;
++		uint64_t splash_pa = 0;
++		uint64_t pool_pa = 0;
++		uint32_t pool_idx = ~0u;
++		bool splash = false;
++
++		/*
++		 * Full-screen layers: a reserved flip-pool slot first, then the ABL
++		 * splash carve-out the DPU already scans, then wired pages. Only the
++		 * first two are addressable by the display controller, so how many
++		 * layers can flip is decided here.
++		 */
++		mem = sweet_surface_pool_alloc(s, &pool_pa, &pool_idx);
++		if (mem != NULL) {
++			s->poolIdx = pool_idx;
++			s->physAddr = pool_pa;
++			s->mapCache = kIOMapDefaultCache;
++			OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		} else if ((mem = sweet_surface_splash_alloc(s, &splash_pa)) != NULL) {
++			splash = true;
++			s->physAddr = splash_pa;
++			s->mapCache = kIOMapCopybackCache;
++			/* Splash RAM is not charged to the wired budget. */
++		} else if ((uint64_t)OSAddAtomic64(s->allocSize,
++		    (volatile SInt64 *)&sweet_surface_wired) + s->allocSize <=
++		    SWEET_SURFACE_WIRED_MAX) {
++			IOBufferMemoryDescriptor *buf = NULL;
++			if (sweet_surface_want_contig(s)) {
++				buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared |
++				    kIOMemoryPhysicallyContiguous,
++				    s->allocSize, 0x00000000ffffffffull);
++			}
++			if (buf == NULL) {
++				buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared,
++				    s->allocSize, page_size);
++			}
++			mem = buf;
++			if (mem == NULL) {
++				OSAddAtomic64(-(SInt64)s->allocSize,
++				    (volatile SInt64 *)&sweet_surface_wired);
++			}
++		}
++		if (mem == NULL) {
++			ret = kIOReturnNoMemory;
++		} else {
++			if (!splash) {
++				IOBufferMemoryDescriptor *buf =
++				    OSDynamicCast(IOBufferMemoryDescriptor, mem);
++				if (buf != NULL) {
++					bzero(buf->getBytesNoCopy(), s->allocSize);
++				}
++				s->mapCache = kIOMapDefaultCache;
++			}
++			s->memory = mem;
++			if (!splash && pool_idx == ~0u && sweet_surface_want_contig(s)) {
++				/* Pool slots already carry the PA we allocated them at; only
++				 * a fresh contiguous buffer needs to be interrogated. */
++				sweet_surface_capture_phys(s);
++			}
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	}
++	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 16) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		sweet_surface_creates_logged++;
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u "
++		    "phys 0x%llx keys %u -> 0x%x\n",
++		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
++		    s->bytesPerRow, s->planeCount, s->allocSize,
++		    (unsigned long long)s->physAddr, props->getCount(), ret);
++	}
++	props->release();
++	if (ret != kIOReturnSuccess) {
++		s->release();
++		return ret;
++	}
++	ret = returnSurface(s, args);   /* takes the creator's user count */
++	s->release();
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++
++	switch (selector) {
++	case kSweetSurfaceLimits: {
++		uint8_t limits[0x18] = { 0 };
++		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
++		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
++		limits[0x16] = 1;
++		sweet_surf_log_once("sel", selector);
++		return sweet_struct_out(args, limits, sizeof(limits));
++	}
++	case kSweetSurfaceCreate:
++		return create(args);
++	case kSweetSurfaceLookup: {
++		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
++		IOReturn ret = kIOReturnNotFound;
++		if (s != NULL) {
++			ret = sweet_surface_get(s) ? returnSurface(s, args) : kIOReturnNotFound;
++			s->release();
++		}
++		sweet_surf_log_once("sel", selector);
++		return ret;
++	}
++	case kSweetSurfaceLookupFromPort: {
++		OSObject *obj = NULL;
++		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
++		SweetSurface *s = OSDynamicCast(SweetSurface, obj);
++		if (ret == kIOReturnSuccess) {
++			ret = (s != NULL && sweet_surface_get(s)) ? returnSurface(s, args) : kIOReturnBadArgument;
++		}
++		OSSafeReleaseNULL(obj);
++		sweet_surf_log_once("sel", selector);
++		return ret;
++	}
++	case kSweetSurfaceCreatePort: {
++		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
++		if (s == NULL || args->scalarOutputCount < 1) {
++			OSSafeReleaseNULL(s);
++			return kIOReturnNotFound;
++		}
++		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
++		args->scalarOutputCount = 1;
++		s->release();
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
++	default:
++		/* Values, notifications, ownership, timestamps...: accept and ignore. */
++		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++			args->scalarOutput[i] = 0;
++		}
++		if (args->structureOutput != NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++		}
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
++    void *, void *, void *, void *)
++{
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
++{
++	uint32_t seed = bump ? OSIncrementAtomic((volatile SInt32 *)sweet_surface_seed(s)) + 1 :
++	    *sweet_surface_seed(s);
++	if (seedOut != NULL && copyout(&seed, (user_addr_t)seedOut, sizeof(seed)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	return kIOReturnSuccess;
++}
++
++/* Retained surface this client created or looked up, or NULL. */
++static SweetSurface *
++sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
++{
++	SweetSurface *s = NULL;
++	IOLockLock(lock);
++	for (unsigned int i = 0; i < refs->getCount(); i++) {
++		SweetSurfaceRef *ref = (SweetSurfaceRef *)refs->getObject(i);
++		if (ref->surface->id == id) {
++			s = ref->surface;
++			s->retain();
++			break;
++		}
++	}
++	IOLockUnlock(lock);
++	return s;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++    void *, void *, void *)
++{
++	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++	s->release();
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
++    void *, void *, void *)
++{
++	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	IOReturn ret = sweet_surface_seed_out(s, seedOut,
++	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	s->release();
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
++{
++	unsigned int index;
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
++	if (ref != NULL && --ref->count == 0) {
++		fRefs->removeObject(index);     /* unmaps and drops the user count */
++	}
++	IOLockUnlock(fLock);
++	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
++static IOExternalTrap sweet_surface_traps[] = {
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
++	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
++	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++};
++
++IOExternalTrap *
++IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
++{
++	if (index >= sizeof(sweet_surface_traps) / sizeof(sweet_surface_traps[0])) {
++		sweet_surf_log_once("trap", index);
++		return NULL;
++	}
++	sweet_surf_log_once("trap", index);
++	*targetP = this;
++	return &sweet_surface_traps[index];
++}
++#endif /* SWEET */
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -1,84 +1,95 @@
+-/*
+- * Built-in IOSurface for SWEET (see SweetSurface.cpp).
+- *
+- * Shared with SweetFramebuffer.cpp: the framebuffer looks surfaces up by
+- * id when a swap names them and publishes the panel memory itself as the
+- * default framebuffer surface.
+- */
+-#ifndef _SWEET_SURFACE_H
+-#define _SWEET_SURFACE_H
+-
+-#include <pexpert/arm64/board_config.h>
+-
+-#if defined(SWEET)
+-#include <IOKit/IOMemoryDescriptor.h>
+-#include <IOKit/IOBufferMemoryDescriptor.h>
+-#include <libkern/c++/OSObject.h>
+-#include <mach/mach_types.h>
+-
+-#define SWEET_SURFACE_MAX_PLANES        20
+-
+-struct sweet_surface_plane {
+-	uint32_t width, height, bytesPerRow, offset, size;
+-	uint16_t bytesPerElement;
+-	uint8_t  elementWidth, elementHeight;
+-};
+-
+-class SweetSurface : public OSObject {
+-	OSDeclareDefaultStructors(SweetSurface);
+-
+-public:
+-	uint32_t id;
+-	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
+-	uint16_t bytesPerElement;
+-	uint8_t  elementWidth, elementHeight;
+-	uint32_t cacheMode, planeCount, parentID;
+-	uint64_t physAddr;      /* first byte PA if contiguous & known, else 0 */
+-	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+-
+-	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
+-	IOOptionBits              mapCache;     /* cache mode for user mappings */
+-	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+-	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+-
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+-	void free() APPLE_KEXT_OVERRIDE;
+-
+-	/* Kernel address of the pixels (mapped on first use), or 0. */
+-	uintptr_t kernelAddress();
+-};
+-
+-/*
+- * Physically contiguous PA of the pixel bytes (offset applied), or 0 if the
+- * backing store is not a single 32-bit-addressable contiguous region. Used by
+- * the DPU flip path (docs/GPU.md): the display controller has no SMMU map for
+- * arbitrary RAM, so only these surfaces can be scanned out directly.
+- */
+-uint64_t sweet_surface_phys(SweetSurface *s);
+-
+-/*
+- * Carve the ABL splash region (disp_rdump_region, typically 24 MB at
+- * 0x9c000000) into slots the DPU can already scan. Full-screen IOSurfaces
+- * are allocated from those slots so CoreAnimation draws into memory the
+- * display controller can flip to - no expensive contiguous DRAM alloc.
+- * Slot 0 is the live panel (owned by AppleCLCD); CA gets 1..N-1.
+- */
+-void sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
+-    uint32_t slot_bytes);
+-
+-/* Retained surface for an id, or NULL. */
+-SweetSurface *sweet_surface_copy(uint32_t id);
+-
+-/*
+- * Publish physical memory (the panel framebuffer) as a surface. Returns a
+- * retained surface that stays in the id table until released by the caller
+- * and every user.
+- */
+-SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+-    uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+-
+-/* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+-mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+-
+-#endif /* SWEET */
+-#endif /* _SWEET_SURFACE_H */
++/*
++ * Built-in IOSurface for SWEET (see SweetSurface.cpp).
++ *
++ * Shared with SweetFramebuffer.cpp: the framebuffer looks surfaces up by
++ * id when a swap names them and publishes the panel memory itself as the
++ * default framebuffer surface.
++ */
++#ifndef _SWEET_SURFACE_H
++#define _SWEET_SURFACE_H
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSObject.h>
++#include <mach/mach_types.h>
++
++#define SWEET_SURFACE_MAX_PLANES        20
++
++struct sweet_surface_plane {
++	uint32_t width, height, bytesPerRow, offset, size;
++	uint16_t bytesPerElement;
++	uint8_t  elementWidth, elementHeight;
++};
++
++class SweetSurface : public OSObject {
++	OSDeclareDefaultStructors(SweetSurface);
++
++public:
++	uint32_t id;
++	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
++	uint16_t bytesPerElement;
++	uint8_t  elementWidth, elementHeight;
++	uint32_t cacheMode, planeCount, parentID;
++	uint64_t physAddr;      /* first byte PA if contiguous & known, else 0 */
++	uint32_t poolIdx;       /* flip-pool slot backing this surface, or ~0 */
++	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
++
++	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
++	IOOptionBits              mapCache;     /* cache mode for user mappings */
++	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
++	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++
++	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	void free() APPLE_KEXT_OVERRIDE;
++
++	/* Kernel address of the pixels (mapped on first use), or 0. */
++	uintptr_t kernelAddress();
++};
++
++/*
++ * Physically contiguous PA of the pixel bytes (offset applied), or 0 if the
++ * backing store is not a single 32-bit-addressable contiguous region. Used by
++ * the DPU flip path (docs/GPU.md): the display controller has no SMMU map for
++ * arbitrary RAM, so only these surfaces can be scanned out directly.
++ */
++uint64_t sweet_surface_phys(SweetSurface *s);
++
++/*
++ * Carve the ABL splash region (disp_rdump_region, typically 24 MB at
++ * 0x9c000000) into slots the DPU can already scan. Full-screen IOSurfaces
++ * are allocated from those slots so CoreAnimation draws into memory the
++ * display controller can flip to - no expensive contiguous DRAM alloc.
++ * Slot 0 is the live panel (owned by AppleCLCD); CA gets 1..N-1.
++ */
++void sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
++    uint32_t slot_bytes);
++
++/*
++ * Reserve count physically contiguous, 32-bit-addressable buffers of slot_bytes
++ * for full-screen layers. The ABL carve-out holds a single CA-sized slot, so a
++ * compositor that rotates two surfaces made only every other frame flippable
++ * (the DPU has no SMMU map, it cannot scan wired pages). These slots are
++ * handed out before the splash slot; returns how many were reserved, 0 leaves
++ * the old single-slot behaviour. Called once from AppleCLCD::start().
++ */
++uint32_t sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count);
++
++/* Retained surface for an id, or NULL. */
++SweetSurface *sweet_surface_copy(uint32_t id);
++
++/*
++ * Publish physical memory (the panel framebuffer) as a surface. Returns a
++ * retained surface that stays in the id table until released by the caller
++ * and every user.
++ */
++SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
++    uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
++
++/* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
++mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
++
++#endif /* SWEET */
++#endif /* _SWEET_SURFACE_H */
+--- a/iokit/Kernel/arm/SweetDisplay.cpp
++++ b/iokit/Kernel/arm/SweetDisplay.cpp
+@@ -1,551 +1,628 @@
+-/*
+- * DAVINCI: probe + zero-copy flip of the display controller (MDSS/SDE) that
+- * the bootloader left running.
+- *
+- * The whole display path today is "CPU writes the ABL splash buffer at
+- * 0x9c000000 and the DPU keeps scanning it out". The registers that do that
+- * are configured by the bootloader; the probe reads them, remembers the live
+- * SSPP SRC_ADDR / YSTRIDE and the CTL flush bit, and (only when asked via
+- * sweet_display_flip) rewrites SRC_ADDR so a present is two MMIO writes
+- * instead of a 10 MB memcpy. See docs/GPU.md.
+- *
+- * Register offsets below are the davinci DTB values relative to mdp_phys
+- * 0xae00000. SSPP_SRC0_ADDR = +0x14, SSPP_SRC_YSTRIDE0 = +0x24, CTL_FLUSH =
+- * +0x018, CTL_START = +0x01C (Linux dpu_hw_sspp / dpu_hw_ctl). Flush bits
+- * match SDE: VIG0/1 = 0/1, DMA0/1/2 = 11/12/24, LM0 = 6.
+- */
+-#include "SweetDisplay.h"
+-
+-/* MACHINE_FLAGS passes -DARM64_BOARD_CONFIG_SWEET; the MASTER `SWEET`
+- * config option is NOT visible to every optional iokitcpp TU. Using the
+- * board macro (same as sweet_gpu.c / SweetAccelerator.cpp) is what actually
+- * compiles the DPU probe+flip — otherwise only the #else stubs link and
+- * sweet_display_can_flip() is permanently false → 10 MB CPU present forever. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-
+-#include <IOKit/IOLib.h>
+-#include <pexpert/pexpert.h>
+-
+-extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
+-
+-#define MDSS_PA             0x0ae00000u
+-#define MDSS_SIZE           0x00084208u
+-#define MDSS_SDE_OFF        0x01000u
+-#define DSI0_PA             0x0ae94000u
+-#define DSI0_SIZE           0x00001000u
+-
+-#define SSPP_SRC0_ADDR      0x014u
+-#define SSPP_SRC_YSTRIDE0   0x024u
+-#define SSPP_SRC_XY         0x028u
+-#define SSPP_DST_XY         0x02Cu
+-#define SSPP_SRC_SIZE       0x030u
+-#define SSPP_DST_SIZE       0x034u
+-#define SSPP_SRC_FORMAT     0x038u
+-#define CTL_FLUSH           0x018u
+-#define CTL_START           0x01Cu
+-#define CTL_LAYER           0x000u
+-
+-/*
+- * SRC_SIZE / DST_SIZE pack width and height in the two 16-bit halves; older
+- * and newer SDE revisions disagree on whether the fields hold the size or
+- * size-1, so the probe derives the encoding from the live DST_SIZE (which
+- * must be the panel rect, since the CPU copy into the panel shows 1:1) and
+- * refuses to touch geometry it cannot decode.
+- */
+-#define SWEET_SIZE_UNKNOWN  0
+-#define SWEET_SIZE_DIRECT   1
+-#define SWEET_SIZE_MINUS1   2
+-
+-struct sweet_dpu_block {
+-	const char *name;
+-	uint32_t    off;
+-	uint32_t    len;
+-	bool        live;
+-	uint32_t    flush;      /* CTL_FLUSH bit for this SSPP, 0 if not an SSPP */
+-};
+-
+-static const struct sweet_dpu_block kDpuBlocks[] = {
+-	{ "top",   0x01000u, 0x45cu, false, 0 },
+-	{ "ctl0",  0x02000u, 0x1e0u, false, 0 },
+-	{ "ctl1",  0x02200u, 0x1e0u, false, 0 },
+-	{ "ctl2",  0x02400u, 0x1e0u, false, 0 },
+-	{ "ctl3",  0x02600u, 0x1e0u, false, 0 },
+-	{ "lm0",   0x45000u, 0x320u, true,  0 },
+-	{ "lm1",   0x46000u, 0x320u, true,  0 },
+-	{ "lm2",   0x47000u, 0x320u, true,  0 },
+-	{ "lm3",   0x48000u, 0x320u, true,  0 },
+-	{ "vig0",  0x05000u, 0x1f0u, false, (1u << 0) },
+-	{ "vig1",  0x07000u, 0x1f0u, false, (1u << 1) },
+-	{ "dma0",  0x25000u, 0x1f0u, false, (1u << 11) },
+-	{ "dma1",  0x27000u, 0x1f0u, false, (1u << 12) },
+-	{ "dma2",  0x29000u, 0x1f0u, false, (1u << 24) },
+-	{ "intf0", 0x6b000u, 0x100u, true,  0 },
+-	{ "intf1", 0x6b800u, 0x100u, true,  0 },
+-	{ "intf2", 0x6c000u, 0x100u, true,  0 },
+-	{ "intf3", 0x6c800u, 0x100u, true,  0 },
+-	{ "pp0",   0x71000u, 0x0d4u, true,  0 },
+-	{ "pp1",   0x71800u, 0x0d4u, true,  0 },
+-	{ "pp2",   0x72000u, 0x0d4u, true,  0 },
+-	{ "pp3",   0x72800u, 0x0d4u, true,  0 },
+-};
+-
+-#define SWEET_DPU_LIVE_WORDS    64
+-
+-struct sweet_dpu_state {
+-	vm_offset_t mdss;
+-	uint32_t    sspp_off;
+-	uint32_t    src_addr_off;   /* absolute from mdss base */
+-	uint32_t    src_stride_off;
+-	uint32_t    src_xy_off;     /* absolute from mdss base */
+-	uint32_t    src_size_off;
+-	uint32_t    dst_xy_off;
+-	uint32_t    dst_size_off;
+-	uint32_t    ctl_off;
+-	uint32_t    ctl_bits;       /* bit i = ctl i carries a live LAYER */
+-	uint32_t    flush_mask;
+-	uint32_t    orig_pa;
+-	uint32_t    orig_stride;
+-	uint32_t    orig_src_size;
+-	uint32_t    orig_dst_size;
+-	uint32_t    orig_src_xy;
+-	uint32_t    cur_pa;
+-	uint32_t    cur_stride;
+-	uint32_t    cur_src_size;
+-	uint32_t    cur_x, cur_y;    /* source window origin */
+-	uint32_t    cur_w, cur_h;    /* source window size (= panel) */
+-	int         size_enc;       /* SWEET_SIZE_* */
+-	int         video_mode;     /* INTF/PP counters moved */
+-	int         ready;
+-	int         disabled;       /* a flip failed to latch, stay on CPU copy */
+-	const char *sspp_name;
+-};
+-
+-static struct sweet_dpu_state g_dpu;
+-
+-static uint32_t
+-dpu_rd(vm_offset_t base, uint32_t off)
+-{
+-	return *(volatile uint32_t *)(base + off);
+-}
+-
+-static void
+-dpu_wr(vm_offset_t base, uint32_t off, uint32_t v)
+-{
+-	*(volatile uint32_t *)(base + off) = v;
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
+-
+-static uint32_t
+-dpu_size_lo(uint32_t v, int enc)
+-{
+-	return (v & 0xffffu) + (enc == SWEET_SIZE_MINUS1 ? 1u : 0u);
+-}
+-
+-static uint32_t
+-dpu_size_hi(uint32_t v, int enc)
+-{
+-	return (v >> 16) + (enc == SWEET_SIZE_MINUS1 ? 1u : 0u);
+-}
+-
+-static uint32_t
+-dpu_size_pack(uint32_t w, uint32_t h, int enc)
+-{
+-	uint32_t lo = w - (enc == SWEET_SIZE_MINUS1 ? 1u : 0u);
+-	uint32_t hi = h - (enc == SWEET_SIZE_MINUS1 ? 1u : 0u);
+-
+-	return ((hi & 0xffffu) << 16) | (lo & 0xffffu);
+-}
+-
+-static uint32_t
+-dpu_xy_pack(uint32_t x, uint32_t y)
+-{
+-	return ((y & 0xffffu) << 16) | (x & 0xffffu);
+-}
+-
+-/*
+- * CTL offsets of the 4 SDE control paths (dtb qcom,sde-ctl-off). Every CTL
+- * that has a layer programmed gets the flush and the command-mode kick, so
+- * a wrong guess about which CTL drives DSI0 cannot eat the update.
+- */
+-static const uint32_t kCtlOffsets[] = { 0x02000u, 0x02200u, 0x02400u, 0x02600u };
+-
+-/* sweetdpu=1: discover quietly. sweetdpu=2: dump every nonzero register. */
+-static int g_dpu_verbose;
+-
+-static void
+-dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
+-    uint32_t fb_pa, uint32_t fb_stride, uint32_t *words, uint32_t *nonzero)
+-{
+-	for (uint32_t off = 0; off + 4 <= b->len; off += 4) {
+-		uint32_t v = dpu_rd(base, b->off + off);
+-
+-		(*words)++;
+-		if (v == 0) {
+-			continue;
+-		}
+-		(*nonzero)++;
+-		if (g_dpu_verbose >= 2) {
+-			IOLog("SWEET DPU: %s+0x%03x=0x%08x\n", b->name, off, v);
+-		}
+-		if (v == fb_pa) {
+-			IOLog("SWEET DPU: %s+0x%03x is the panel framebuffer\n",
+-			    b->name, off);
+-			/*
+-			 * Prefer the canonical SRC0_ADDR offset; accept any hit
+-			 * inside an SSPP so a quirky ABL programming still works.
+-			 */
+-			if (b->flush != 0 && (!g_dpu.ready || off == SSPP_SRC0_ADDR)) {
+-				g_dpu.sspp_off = b->off;
+-				g_dpu.src_addr_off = b->off + off;
+-				g_dpu.src_stride_off = b->off + SSPP_SRC_YSTRIDE0;
+-				g_dpu.src_xy_off = b->off + SSPP_SRC_XY;
+-				g_dpu.src_size_off = b->off + SSPP_SRC_SIZE;
+-				g_dpu.dst_xy_off = b->off + SSPP_DST_XY;
+-				g_dpu.dst_size_off = b->off + SSPP_DST_SIZE;
+-				g_dpu.flush_mask = b->flush;
+-				g_dpu.orig_pa = fb_pa;
+-				g_dpu.cur_pa = fb_pa;
+-				g_dpu.sspp_name = b->name;
+-				g_dpu.ready = 1;
+-			}
+-		} else if (v == fb_stride || (v & 0xffffu) == fb_stride) {
+-			IOLog("SWEET DPU: %s+0x%03x is the panel stride\n",
+-			    b->name, off);
+-			if (b->flush != 0) {
+-				g_dpu.orig_stride = fb_stride;
+-				g_dpu.cur_stride = fb_stride;
+-				if (g_dpu.sspp_off == b->off) {
+-					g_dpu.src_stride_off = b->off + off;
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-static void
+-dpu_check_live(vm_offset_t base, const struct sweet_dpu_block *b)
+-{
+-	uint32_t before[SWEET_DPU_LIVE_WORDS], after[SWEET_DPU_LIVE_WORDS];
+-	uint32_t n = b->len / 4;
+-	uint32_t moved = 0, shown = 0;
+-
+-	if (n > SWEET_DPU_LIVE_WORDS) {
+-		n = SWEET_DPU_LIVE_WORDS;
+-	}
+-	for (uint32_t i = 0; i < n; i++) {
+-		before[i] = dpu_rd(base, b->off + 4 * i);
+-	}
+-	IODelay(30000);
+-	for (uint32_t i = 0; i < n; i++) {
+-		after[i] = dpu_rd(base, b->off + 4 * i);
+-		if (after[i] == before[i]) {
+-			continue;
+-		}
+-		moved++;
+-		if (g_dpu_verbose >= 2 && shown < 4) {
+-			shown++;
+-			IOLog("SWEET DPU: %s+0x%03x moved 0x%08x -> 0x%08x\n",
+-			    b->name, 4 * i, before[i], after[i]);
+-		}
+-	}
+-	if (g_dpu_verbose >= 2 || moved != 0) {
+-		IOLog("SWEET DPU: %s %u/%u words moved in 30 ms%s\n", b->name, moved, n,
+-		    moved ? " (live)" : "");
+-	}
+-	if (moved != 0 && (b->name[0] == 'i' || b->name[0] == 'p')) {
+-		/* intf* / pp* counters advancing => video mode. */
+-		g_dpu.video_mode = 1;
+-	}
+-}
+-
+-static void
+-dpu_pick_ctls(vm_offset_t base)
+-{
+-	for (unsigned int i = 0; i < sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0]); i++) {
+-		uint32_t layer = dpu_rd(base, kCtlOffsets[i] + CTL_LAYER);
+-
+-		if (layer == 0) {
+-			continue;
+-		}
+-		g_dpu.ctl_bits |= 1u << i;
+-		IOLog("SWEET DPU: ctl%u live (layer=0x%08x)\n", i, layer);
+-	}
+-	if (g_dpu.ctl_bits == 0) {
+-		g_dpu.ctl_bits = 1u << 0;
+-		IOLog("SWEET DPU: no live CTL_LAYER, defaulting to ctl0\n");
+-	}
+-	g_dpu.ctl_off = kCtlOffsets[0];
+-}
+-
+-/* Flush + kick every live CTL; the panels that need it run in command mode. */
+-static void
+-dpu_commit(void)
+-{
+-	for (unsigned int i = 0; i < sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0]); i++) {
+-		if (!(g_dpu.ctl_bits & (1u << i))) {
+-			continue;
+-		}
+-		dpu_wr(g_dpu.mdss, kCtlOffsets[i] + CTL_FLUSH, g_dpu.flush_mask);
+-		if (!g_dpu.video_mode) {
+-			dpu_wr(g_dpu.mdss, kCtlOffsets[i] + CTL_START, 1u);
+-		}
+-	}
+-}
+-
+-void
+-sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
+-    uint32_t fb_width, uint32_t fb_height)
+-{
+-	int mode = 1;
+-	uint32_t words = 0, nonzero = 0, found = 0;
+-	vm_offset_t mdss, dsi;
+-
+-	PE_parse_boot_argn("sweetdpu", &mode, sizeof(mode));
+-	if (mode <= 0) {
+-		return;
+-	}
+-	g_dpu_verbose = mode;
+-
+-	bzero(&g_dpu, sizeof(g_dpu));
+-	g_dpu.orig_stride = fb_stride;
+-	g_dpu.cur_stride = fb_stride;
+-
+-	mdss = ml_io_map(MDSS_PA, MDSS_SIZE);
+-	if (mdss == 0) {
+-		IOLog("SWEET DPU: MDSS map failed\n");
+-		return;
+-	}
+-	g_dpu.mdss = mdss;
+-
+-	IOLog("SWEET DPU: panel 0x%llx %ux%u stride %u\n",
+-	    (unsigned long long)fb_phys, fb_width, fb_height, fb_stride);
+-	IOLog("SWEET DPU: mdp 0x%08x sde rev 0x%08x\n", MDSS_PA,
+-	    dpu_rd(mdss, MDSS_SDE_OFF));
+-	if (dpu_rd(mdss, MDSS_SDE_OFF) == 0 ||
+-	    dpu_rd(mdss, MDSS_SDE_OFF) == 0xffffffffu) {
+-		IOLog("SWEET DPU: SDE not clocked, no register dump\n");
+-		return;
+-	}
+-
+-	for (unsigned int i = 0; i < sizeof(kDpuBlocks) / sizeof(kDpuBlocks[0]); i++) {
+-		dpu_dump_block(mdss, &kDpuBlocks[i], (uint32_t)fb_phys, fb_stride,
+-		    &words, &nonzero);
+-	}
+-	IOLog("SWEET DPU: mdp dump %u words, %u nonzero\n", words, nonzero);
+-
+-	for (unsigned int i = 0; i < sizeof(kDpuBlocks) / sizeof(kDpuBlocks[0]); i++) {
+-		if (kDpuBlocks[i].live) {
+-			dpu_check_live(mdss, &kDpuBlocks[i]);
+-		}
+-	}
+-
+-	dpu_pick_ctls(mdss);
+-
+-	/*
+-	 * Geometry the bootloader left live. The CPU copy paints the whole panel
+-	 * 1:1 out of this very pipeline, so DST_SIZE must be the panel rect and
+-	 * SRC_SIZE the same: that is what makes a repoint safe. Decode the
+-	 * size-1 vs size encoding from DST_SIZE; if it matches neither, leave
+-	 * SRC_SIZE/DST_SIZE alone and only allow same-geometry flips.
+-	 */
+-	if (g_dpu.ready) {
+-		uint32_t src, dst, src_xy, dst_xy, fmt;
+-
+-		src = dpu_rd(mdss, g_dpu.src_size_off);
+-		dst = dpu_rd(mdss, g_dpu.dst_size_off);
+-		src_xy = dpu_rd(mdss, g_dpu.src_xy_off);
+-		dst_xy = dpu_rd(mdss, g_dpu.dst_xy_off);
+-		fmt = dpu_rd(mdss, g_dpu.sspp_off + SSPP_SRC_FORMAT);
+-		g_dpu.orig_src_size = src;
+-		g_dpu.orig_dst_size = dst;
+-		g_dpu.orig_src_xy = src_xy;
+-		g_dpu.cur_src_size = src;
+-		g_dpu.cur_w = fb_width;
+-		g_dpu.cur_h = fb_height;
+-		if (dpu_size_lo(dst, SWEET_SIZE_MINUS1) == fb_width &&
+-		    dpu_size_hi(dst, SWEET_SIZE_MINUS1) == fb_height) {
+-			g_dpu.size_enc = SWEET_SIZE_MINUS1;
+-		} else if (dpu_size_lo(dst, SWEET_SIZE_DIRECT) == fb_width &&
+-		    dpu_size_hi(dst, SWEET_SIZE_DIRECT) == fb_height) {
+-			g_dpu.size_enc = SWEET_SIZE_DIRECT;
+-		}
+-		IOLog("SWEET DPU: plane src_size 0x%08x dst_size 0x%08x src_xy "
+-		    "0x%08x dst_xy 0x%08x fmt 0x%08x sizes are %s\n",
+-		    src, dst, src_xy, dst_xy, fmt,
+-		    g_dpu.size_enc == SWEET_SIZE_MINUS1 ? "size-1" :
+-		    g_dpu.size_enc == SWEET_SIZE_DIRECT ? "size" : "unknown");
+-	}
+-
+-	dsi = ml_io_map(DSI0_PA, DSI0_SIZE);
+-	if (dsi == 0) {
+-		IOLog("SWEET DPU: DSI0 map failed\n");
+-	} else {
+-	for (uint32_t off = 0; off < 0x100; off += 4) {
+-		uint32_t v = dpu_rd(dsi, off);
+-
+-		if (v == 0) {
+-			continue;
+-		}
+-		found++;
+-		if (g_dpu_verbose >= 2) {
+-			IOLog("SWEET DPU: dsi0+0x%03x=0x%08x\n", off, v);
+-		}
+-	}
+-	IOLog("SWEET DPU: dsi0 0x%08x, %u nonzero words\n", DSI0_PA, found);
+-	}
+-
+-	if (g_dpu.ready) {
+-		IOLog("SWEET DPU: flip ready on %s SRC_ADDR=+0x%x YSTRIDE=+0x%x "
+-		    "SZ=+0x%x CTL0x%x flush=0x%x %s%s%s\n",
+-		    g_dpu.sspp_name ? g_dpu.sspp_name : "?",
+-		    g_dpu.src_addr_off, g_dpu.src_stride_off, g_dpu.src_size_off,
+-		    g_dpu.ctl_bits, g_dpu.flush_mask,
+-		    g_dpu.video_mode ? "video" : "cmd-or-idle",
+-		    g_dpu.size_enc == SWEET_SIZE_UNKNOWN ? " geom-locked" : "",
+-		    g_dpu.orig_src_xy != 0 ? " src-xy-nonzero" : "");
+-	} else {
+-		IOLog("SWEET DPU: no SSPP holds the panel PA - flip disabled\n");
+-	}
+-}
+-
+-bool
+-sweet_display_can_flip(void)
+-{
+-	return g_dpu.ready && !g_dpu.disabled &&
+-	    g_dpu.mdss != 0 && g_dpu.ctl_bits != 0;
+-}
+-
+-/* Put the plane back exactly as the bootloader left it (panel PA, geometry). */
+-static void
+-dpu_restore(void)
+-{
+-	if (!g_dpu.ready || g_dpu.mdss == 0) {
+-		return;
+-	}
+-	dpu_wr(g_dpu.mdss, g_dpu.src_size_off, g_dpu.orig_src_size);
+-	dpu_wr(g_dpu.mdss, g_dpu.dst_size_off, g_dpu.orig_dst_size);
+-	dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, g_dpu.orig_src_xy);
+-	dpu_wr(g_dpu.mdss, g_dpu.src_stride_off,
+-	    (dpu_rd(g_dpu.mdss, g_dpu.src_stride_off) & 0xffff0000u) |
+-	    (g_dpu.orig_stride & 0xffffu));
+-	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, g_dpu.orig_pa);
+-	dpu_commit();
+-	g_dpu.cur_pa = g_dpu.orig_pa;
+-	g_dpu.cur_stride = g_dpu.orig_stride;
+-	g_dpu.cur_src_size = g_dpu.orig_src_size;
+-	g_dpu.cur_x = 0;
+-	g_dpu.cur_y = 0;
+-}
+-
+-/*
+- * Point the live SSPP at phys (32-bit PA) with the given bytes-per-row and,
+- * optionally, a source window origin inside that buffer (the centered panel
+- * crop of a larger logical surface) and window size (defaults to the panel
+- * rect the probe recorded).
+- *
+- * Only SRC_ADDR / YSTRIDE0 / SRC_XY change; the mixer, format and scaling
+- * stay as the bootloader left them, and the source window keeps the panel
+- * size, so the fetcher walks exactly the pixels the CPU copy used to move.
+- * A size the encoding cannot be derived for is never written - a wrong
+- * SRC_SIZE is what scrambles a flip.
+- */
+-bool
+-sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
+-    uint32_t width, uint32_t height)
+-{
+-	uint32_t ystride, size, latched;
+-
+-	if (!sweet_display_can_flip() || phys == 0 || width == 0 || height == 0) {
+-		return false;
+-	}
+-	if (g_dpu.size_enc == SWEET_SIZE_UNKNOWN &&
+-	    (x != 0 || y != 0 || width != g_dpu.cur_w || height != g_dpu.cur_h)) {
+-		/* Cannot express a window without knowing the SRC_SIZE encoding. */
+-		return false;
+-	}
+-	if (phys == g_dpu.cur_pa && stride == g_dpu.cur_stride &&
+-	    x == g_dpu.cur_x && y == g_dpu.cur_y &&
+-	    width == g_dpu.cur_w && height == g_dpu.cur_h) {
+-		return true;
+-	}
+-
+-	if (g_dpu.size_enc != SWEET_SIZE_UNKNOWN) {
+-		size = dpu_size_pack(width, height, g_dpu.size_enc);
+-		if (size != g_dpu.cur_src_size) {
+-			dpu_wr(g_dpu.mdss, g_dpu.src_size_off, size);
+-			dpu_wr(g_dpu.mdss, g_dpu.dst_size_off, size);
+-			g_dpu.cur_src_size = size;
+-		}
+-		dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, dpu_xy_pack(x, y));
+-	}
+-	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, phys);
+-	if (stride != 0 && stride != g_dpu.cur_stride) {
+-		ystride = dpu_rd(g_dpu.mdss, g_dpu.src_stride_off);
+-		ystride = (ystride & 0xffff0000u) | (stride & 0xffffu);
+-		dpu_wr(g_dpu.mdss, g_dpu.src_stride_off, ystride);
+-		g_dpu.cur_stride = stride;
+-	}
+-	dpu_commit();
+-
+-	latched = dpu_rd(g_dpu.mdss, g_dpu.src_addr_off);
+-	if (latched != phys) {
+-		IOLog("SWEET DPU: flip did not stick (0x%08x != 0x%08x), "
+-		    "restoring and disabling\n", latched, phys);
+-		dpu_restore();
+-		g_dpu.disabled = 1;
+-		return false;
+-	}
+-	g_dpu.cur_pa = phys;
+-	g_dpu.cur_x = x;
+-	g_dpu.cur_y = y;
+-	g_dpu.cur_w = width;
+-	g_dpu.cur_h = height;
+-	return true;
+-}
+-
+-void
+-sweet_display_flip_reset(void)
+-{
+-	if (!g_dpu.ready || g_dpu.orig_pa == 0) {
+-		return;
+-	}
+-	dpu_restore();
+-}
+-
+-#else /* !ARM64_BOARD_CONFIG_SWEET */
+-
+-void
+-sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
+-    uint32_t fb_width, uint32_t fb_height)
+-{
+-	(void)fb_phys;
+-	(void)fb_stride;
+-	(void)fb_width;
+-	(void)fb_height;
+-}
+-
+-bool
+-sweet_display_can_flip(void)
+-{
+-	return false;
+-}
+-
+-bool
+-sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
+-    uint32_t width, uint32_t height)
+-{
+-	(void)phys;
+-	(void)stride;
+-	(void)x;
+-	(void)y;
+-	(void)width;
+-	(void)height;
+-	return false;
+-}
+-
+-void
+-sweet_display_flip_reset(void)
+-{
+-}
+-
+-#endif /* SWEET */
++/*
++ * DAVINCI: probe + zero-copy flip of the display controller (MDSS/SDE) that
++ * the bootloader left running.
++ *
++ * The whole display path today is "CPU writes the ABL splash buffer at
++ * 0x9c000000 and the DPU keeps scanning it out". The registers that do that
++ * are configured by the bootloader; the probe reads them, remembers the live
++ * SSPP SRC_ADDR / YSTRIDE and the CTL flush bit, and (only when asked via
++ * sweet_display_flip) rewrites SRC_ADDR so a present is two MMIO writes
++ * instead of a 10 MB memcpy. See docs/GPU.md.
++ *
++ * Register offsets below are the davinci DTB values relative to mdp_phys
++ * 0xae00000. SSPP_SRC0_ADDR = +0x14, SSPP_SRC_YSTRIDE0 = +0x24, CTL_FLUSH =
++ * +0x018, CTL_START = +0x01C (Linux dpu_hw_sspp / dpu_hw_ctl). Flush bits
++ * match SDE: VIG0/1 = 0/1, DMA0/1/2 = 11/12/24, LM0 = 6.
++ */
++#include "SweetDisplay.h"
++
++/* MACHINE_FLAGS passes -DARM64_BOARD_CONFIG_SWEET; the MASTER `SWEET`
++ * config option is NOT visible to every optional iokitcpp TU. Using the
++ * board macro (same as sweet_gpu.c / SweetAccelerator.cpp) is what actually
++ * compiles the DPU probe+flip — otherwise only the #else stubs link and
++ * sweet_display_can_flip() is permanently false → 10 MB CPU present forever. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
++
++#define MDSS_PA             0x0ae00000u
++#define MDSS_SIZE           0x00084208u
++#define MDSS_SDE_OFF        0x01000u
++#define DSI0_PA             0x0ae94000u
++#define DSI0_SIZE           0x00001000u
++
++#define SSPP_SRC0_ADDR      0x014u
++#define SSPP_SRC_YSTRIDE0   0x024u
++#define SSPP_SRC_XY         0x028u
++#define SSPP_DST_XY         0x02Cu
++#define SSPP_SRC_SIZE       0x030u
++#define SSPP_DST_SIZE       0x034u
++#define SSPP_SRC_FORMAT     0x038u
++#define CTL_FLUSH           0x018u
++#define CTL_START           0x01Cu
++#define CTL_LAYER           0x000u
++
++/*
++ * SRC_SIZE / DST_SIZE / SRC_XY pack two 16-bit fields with one macro, but the
++ * SDE revisions disagree on the order (width in the low or the high half) and
++ * on whether the fields hold size or size-1. Do not trust either: decode the
++ * live DST_SIZE, which must be the panel rect because the CPU copy into the
++ * panel shows 1:1, and keep the candidate that reproduces it. SRC_XY uses the
++ * same order. Geometry that cannot be decoded is never written.
++ */
++static const struct {
++	int minus1;
++	int swap;       /* width in the high half */
++} kSizeEnc[] = {
++	{ 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 },
++};
++#define SWEET_SIZE_ENCS     (sizeof(kSizeEnc) / sizeof(kSizeEnc[0]))
++#define SWEET_SIZE_UNKNOWN  0   /* or the 1-based index in kSizeEnc */
++
++struct sweet_dpu_block {
++	const char *name;
++	uint32_t    off;
++	uint32_t    len;
++	bool        live;
++	uint32_t    flush;      /* CTL_FLUSH bit for this SSPP, 0 if not an SSPP */
++};
++
++static const struct sweet_dpu_block kDpuBlocks[] = {
++	{ "top",   0x01000u, 0x45cu, false, 0 },
++	{ "ctl0",  0x02000u, 0x1e0u, false, 0 },
++	{ "ctl1",  0x02200u, 0x1e0u, false, 0 },
++	{ "ctl2",  0x02400u, 0x1e0u, false, 0 },
++	{ "ctl3",  0x02600u, 0x1e0u, false, 0 },
++	{ "lm0",   0x45000u, 0x320u, true,  0 },
++	{ "lm1",   0x46000u, 0x320u, true,  0 },
++	{ "lm2",   0x47000u, 0x320u, true,  0 },
++	{ "lm3",   0x48000u, 0x320u, true,  0 },
++	{ "vig0",  0x05000u, 0x1f0u, false, (1u << 0) },
++	{ "vig1",  0x07000u, 0x1f0u, false, (1u << 1) },
++	{ "dma0",  0x25000u, 0x1f0u, false, (1u << 11) },
++	{ "dma1",  0x27000u, 0x1f0u, false, (1u << 12) },
++	{ "dma2",  0x29000u, 0x1f0u, false, (1u << 24) },
++	{ "intf0", 0x6b000u, 0x100u, true,  0 },
++	{ "intf1", 0x6b800u, 0x100u, true,  0 },
++	{ "intf2", 0x6c000u, 0x100u, true,  0 },
++	{ "intf3", 0x6c800u, 0x100u, true,  0 },
++	{ "pp0",   0x71000u, 0x0d4u, true,  0 },
++	{ "pp1",   0x71800u, 0x0d4u, true,  0 },
++	{ "pp2",   0x72000u, 0x0d4u, true,  0 },
++	{ "pp3",   0x72800u, 0x0d4u, true,  0 },
++};
++
++#define SWEET_DPU_LIVE_WORDS    64
++
++struct sweet_dpu_state {
++	vm_offset_t mdss;
++	uint32_t    sspp_off;
++	uint32_t    src_addr_off;   /* absolute from mdss base */
++	uint32_t    src_stride_off;
++	uint32_t    src_xy_off;     /* absolute from mdss base */
++	uint32_t    src_size_off;
++	uint32_t    dst_xy_off;
++	uint32_t    dst_size_off;
++	uint32_t    ctl_off;
++	uint32_t    ctl_bits;       /* bit i = ctl i carries a live LAYER */
++	uint32_t    flush_mask;
++	uint32_t    orig_pa;
++	uint32_t    orig_stride;
++	uint32_t    orig_src_size;
++	uint32_t    orig_dst_size;
++	uint32_t    orig_src_xy;
++	uint32_t    cur_pa;
++	uint32_t    cur_stride;
++	uint32_t    cur_src_size;
++	uint32_t    cur_x, cur_y;    /* source window origin */
++	uint32_t    cur_w, cur_h;    /* source window size (= panel) */
++	int         size_enc;       /* index into kSizeEnc, 0 = unknown */
++	int         dirty;          /* plane moved off the bootloader state */
++	int         video_mode;     /* INTF/PP counters moved */
++	int         ready;
++	int         disabled;       /* a flip failed to latch, stay on CPU copy */
++	const char *sspp_name;
++};
++
++static struct sweet_dpu_state g_dpu;
++
++static uint32_t
++dpu_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++dpu_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++dpu_size_decode(uint32_t v, int enc, uint32_t *w, uint32_t *h)
++{
++	uint32_t lo = v & 0xffffu;
++	uint32_t hi = v >> 16;
++
++	*w = 0;
++	*h = 0;
++	if (enc <= 0 || enc > (int)SWEET_SIZE_ENCS) {
++		return;
++	}
++	if (kSizeEnc[enc - 1].minus1) {
++		lo++;
++		hi++;
++	}
++	if (kSizeEnc[enc - 1].swap) {
++		*w = hi;
++		*h = lo;
++	} else {
++		*w = lo;
++		*h = hi;
++	}
++}
++
++static uint32_t
++dpu_size_pack(uint32_t w, uint32_t h, int enc)
++{
++	uint32_t lo = w, hi = h;
++
++	if (enc <= 0 || enc > (int)SWEET_SIZE_ENCS) {
++		return 0;
++	}
++	if (kSizeEnc[enc - 1].minus1) {
++		lo--;
++		hi--;
++	}
++	if (kSizeEnc[enc - 1].swap) {
++		return ((lo & 0xffffu) << 16) | (hi & 0xffffu);
++	}
++	return ((hi & 0xffffu) << 16) | (lo & 0xffffu);
++}
++
++/* SRC_XY is programmed with the same macro as SRC_SIZE. */
++static uint32_t
++dpu_xy_pack(uint32_t x, uint32_t y, int enc)
++{
++	if (enc > 0 && enc <= (int)SWEET_SIZE_ENCS && kSizeEnc[enc - 1].swap) {
++		return ((x & 0xffffu) << 16) | (y & 0xffffu);
++	}
++	return ((y & 0xffffu) << 16) | (x & 0xffffu);
++}
++
++static const char *
++dpu_enc_name(void)
++{
++	if (g_dpu.size_enc <= 0 || g_dpu.size_enc > (int)SWEET_SIZE_ENCS) {
++		return "unknown";
++	}
++	if (kSizeEnc[g_dpu.size_enc - 1].swap) {
++		return kSizeEnc[g_dpu.size_enc - 1].minus1 ? "w-high,s-1" : "w-high";
++	}
++	return kSizeEnc[g_dpu.size_enc - 1].minus1 ? "w-low,s-1" : "w-low";
++}
++
++/*
++ * CTL offsets of the 4 SDE control paths (dtb qcom,sde-ctl-off). Every CTL
++ * that has a layer programmed gets the flush and the command-mode kick, so
++ * a wrong guess about which CTL drives DSI0 cannot eat the update.
++ */
++static const uint32_t kCtlOffsets[] = { 0x02000u, 0x02200u, 0x02400u, 0x02600u };
++
++/* sweetdpu=1: discover quietly. sweetdpu=2: dump every nonzero register. */
++static int g_dpu_verbose;
++
++static void
++dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
++    uint32_t fb_pa, uint32_t fb_stride, uint32_t *words, uint32_t *nonzero)
++{
++	for (uint32_t off = 0; off + 4 <= b->len; off += 4) {
++		uint32_t v = dpu_rd(base, b->off + off);
++
++		(*words)++;
++		if (v == 0) {
++			continue;
++		}
++		(*nonzero)++;
++		if (g_dpu_verbose >= 2) {
++			IOLog("SWEET DPU: %s+0x%03x=0x%08x\n", b->name, off, v);
++		}
++		if (v == fb_pa) {
++			IOLog("SWEET DPU: %s+0x%03x is the panel framebuffer\n",
++			    b->name, off);
++			/*
++			 * Prefer the canonical SRC0_ADDR offset; accept any hit
++			 * inside an SSPP so a quirky ABL programming still works.
++			 */
++			if (b->flush != 0 && (!g_dpu.ready || off == SSPP_SRC0_ADDR)) {
++				g_dpu.sspp_off = b->off;
++				g_dpu.src_addr_off = b->off + off;
++				g_dpu.src_stride_off = b->off + SSPP_SRC_YSTRIDE0;
++				g_dpu.src_xy_off = b->off + SSPP_SRC_XY;
++				g_dpu.src_size_off = b->off + SSPP_SRC_SIZE;
++				g_dpu.dst_xy_off = b->off + SSPP_DST_XY;
++				g_dpu.dst_size_off = b->off + SSPP_DST_SIZE;
++				g_dpu.flush_mask = b->flush;
++				g_dpu.orig_pa = fb_pa;
++				g_dpu.cur_pa = fb_pa;
++				g_dpu.sspp_name = b->name;
++				g_dpu.ready = 1;
++			}
++		} else if (v == fb_stride || (v & 0xffffu) == fb_stride) {
++			IOLog("SWEET DPU: %s+0x%03x is the panel stride\n",
++			    b->name, off);
++			if (b->flush != 0) {
++				g_dpu.orig_stride = fb_stride;
++				g_dpu.cur_stride = fb_stride;
++				if (g_dpu.sspp_off == b->off) {
++					g_dpu.src_stride_off = b->off + off;
++				}
++			}
++		}
++	}
++}
++
++static void
++dpu_check_live(vm_offset_t base, const struct sweet_dpu_block *b)
++{
++	uint32_t before[SWEET_DPU_LIVE_WORDS], after[SWEET_DPU_LIVE_WORDS];
++	uint32_t n = b->len / 4;
++	uint32_t moved = 0, shown = 0;
++
++	if (n > SWEET_DPU_LIVE_WORDS) {
++		n = SWEET_DPU_LIVE_WORDS;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		before[i] = dpu_rd(base, b->off + 4 * i);
++	}
++	IODelay(30000);
++	for (uint32_t i = 0; i < n; i++) {
++		after[i] = dpu_rd(base, b->off + 4 * i);
++		if (after[i] == before[i]) {
++			continue;
++		}
++		moved++;
++		if (g_dpu_verbose >= 2 && shown < 4) {
++			shown++;
++			IOLog("SWEET DPU: %s+0x%03x moved 0x%08x -> 0x%08x\n",
++			    b->name, 4 * i, before[i], after[i]);
++		}
++	}
++	if (g_dpu_verbose >= 2 || moved != 0) {
++		IOLog("SWEET DPU: %s %u/%u words moved in 30 ms%s\n", b->name, moved, n,
++		    moved ? " (live)" : "");
++	}
++	if (moved != 0 && (b->name[0] == 'i' || b->name[0] == 'p')) {
++		/* intf* / pp* counters advancing => video mode. */
++		g_dpu.video_mode = 1;
++	}
++}
++
++static void
++dpu_pick_ctls(vm_offset_t base)
++{
++	for (unsigned int i = 0; i < sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0]); i++) {
++		uint32_t layer = dpu_rd(base, kCtlOffsets[i] + CTL_LAYER);
++
++		if (layer == 0) {
++			continue;
++		}
++		g_dpu.ctl_bits |= 1u << i;
++		IOLog("SWEET DPU: ctl%u live (layer=0x%08x)\n", i, layer);
++	}
++	if (g_dpu.ctl_bits == 0) {
++		g_dpu.ctl_bits = 1u << 0;
++		IOLog("SWEET DPU: no live CTL_LAYER, defaulting to ctl0\n");
++	}
++	g_dpu.ctl_off = kCtlOffsets[0];
++}
++
++/* Flush + kick every live CTL; the panels that need it run in command mode. */
++static void
++dpu_commit(void)
++{
++	for (unsigned int i = 0; i < sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0]); i++) {
++		if (!(g_dpu.ctl_bits & (1u << i))) {
++			continue;
++		}
++		dpu_wr(g_dpu.mdss, kCtlOffsets[i] + CTL_FLUSH, g_dpu.flush_mask);
++		if (!g_dpu.video_mode) {
++			dpu_wr(g_dpu.mdss, kCtlOffsets[i] + CTL_START, 1u);
++		}
++	}
++}
++
++void
++sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
++    uint32_t fb_width, uint32_t fb_height)
++{
++	int mode = 1;
++	uint32_t words = 0, nonzero = 0, found = 0;
++	vm_offset_t mdss, dsi;
++
++	PE_parse_boot_argn("sweetdpu", &mode, sizeof(mode));
++	if (mode <= 0) {
++		return;
++	}
++	g_dpu_verbose = mode;
++
++	bzero(&g_dpu, sizeof(g_dpu));
++	g_dpu.orig_stride = fb_stride;
++	g_dpu.cur_stride = fb_stride;
++
++	mdss = ml_io_map(MDSS_PA, MDSS_SIZE);
++	if (mdss == 0) {
++		IOLog("SWEET DPU: MDSS map failed\n");
++		return;
++	}
++	g_dpu.mdss = mdss;
++
++	IOLog("SWEET DPU: panel 0x%llx %ux%u stride %u\n",
++	    (unsigned long long)fb_phys, fb_width, fb_height, fb_stride);
++	IOLog("SWEET DPU: mdp 0x%08x sde rev 0x%08x\n", MDSS_PA,
++	    dpu_rd(mdss, MDSS_SDE_OFF));
++	if (dpu_rd(mdss, MDSS_SDE_OFF) == 0 ||
++	    dpu_rd(mdss, MDSS_SDE_OFF) == 0xffffffffu) {
++		IOLog("SWEET DPU: SDE not clocked, no register dump\n");
++		return;
++	}
++
++	for (unsigned int i = 0; i < sizeof(kDpuBlocks) / sizeof(kDpuBlocks[0]); i++) {
++		dpu_dump_block(mdss, &kDpuBlocks[i], (uint32_t)fb_phys, fb_stride,
++		    &words, &nonzero);
++	}
++	IOLog("SWEET DPU: mdp dump %u words, %u nonzero\n", words, nonzero);
++
++	for (unsigned int i = 0; i < sizeof(kDpuBlocks) / sizeof(kDpuBlocks[0]); i++) {
++		if (kDpuBlocks[i].live) {
++			dpu_check_live(mdss, &kDpuBlocks[i]);
++		}
++	}
++
++	dpu_pick_ctls(mdss);
++
++	/*
++	 * Geometry the bootloader left live. The CPU copy paints the whole panel
++	 * 1:1 out of this very pipeline, so DST_SIZE must be the panel rect and
++	 * SRC_SIZE the same: that is what makes a repoint safe. Decode the
++	 * size-1 vs size encoding from DST_SIZE; if it matches neither, leave
++	 * SRC_SIZE/DST_SIZE alone and only allow same-geometry flips.
++	 */
++	if (g_dpu.ready) {
++		uint32_t src, dst, src_xy, dst_xy, fmt, dw, dh, sw, sh;
++
++		src = dpu_rd(mdss, g_dpu.src_size_off);
++		dst = dpu_rd(mdss, g_dpu.dst_size_off);
++		src_xy = dpu_rd(mdss, g_dpu.src_xy_off);
++		dst_xy = dpu_rd(mdss, g_dpu.dst_xy_off);
++		fmt = dpu_rd(mdss, g_dpu.sspp_off + SSPP_SRC_FORMAT);
++		g_dpu.orig_src_size = src;
++		g_dpu.orig_dst_size = dst;
++		g_dpu.orig_src_xy = src_xy;
++		for (int e = 1; e <= (int)SWEET_SIZE_ENCS; e++) {
++			dpu_size_decode(dst, e, &dw, &dh);
++			if (dw == fb_width && dh == fb_height) {
++				g_dpu.size_enc = e;
++				break;
++			}
++		}
++		dpu_size_decode(src, g_dpu.size_enc, &sw, &sh);
++		dpu_size_decode(dst, g_dpu.size_enc, &dw, &dh);
++		/*
++		 * A decoded origin means the bootloader already cropped the
++		 * source; anything else is the full buffer, so treat the window
++		 * size as the panel and the origin as 0 when the packing is
++		 * unknown (an ADDR-only flip is still safe then).
++		 */
++		if (g_dpu.size_enc != SWEET_SIZE_UNKNOWN) {
++			dpu_size_decode(src_xy, g_dpu.size_enc, &g_dpu.cur_x, &g_dpu.cur_y);
++			g_dpu.cur_w = dw;
++			g_dpu.cur_h = dh;
++		} else {
++			g_dpu.cur_x = 0;
++			g_dpu.cur_y = 0;
++			g_dpu.cur_w = fb_width;
++			g_dpu.cur_h = fb_height;
++		}
++		if (g_dpu.size_enc != SWEET_SIZE_UNKNOWN &&
++		    (g_dpu.cur_x + g_dpu.cur_w > sw || g_dpu.cur_y + g_dpu.cur_h > sh)) {
++			/* Decode does not add up: leave the geometry alone. */
++			g_dpu.size_enc = SWEET_SIZE_UNKNOWN;
++			g_dpu.cur_x = 0;
++			g_dpu.cur_y = 0;
++		}
++		IOLog("SWEET DPU: plane src_size 0x%08x dst_size 0x%08x src_xy "
++		    "0x%08x dst_xy 0x%08x fmt 0x%08x -> src %ux%u dst %ux%u "
++		    "sizes are %s\n",
++		    src, dst, src_xy, dst_xy, fmt, sw, sh, dw, dh, dpu_enc_name());
++	}
++
++	dsi = ml_io_map(DSI0_PA, DSI0_SIZE);
++	if (dsi == 0) {
++		IOLog("SWEET DPU: DSI0 map failed\n");
++	} else {
++	for (uint32_t off = 0; off < 0x100; off += 4) {
++		uint32_t v = dpu_rd(dsi, off);
++
++		if (v == 0) {
++			continue;
++		}
++		found++;
++		if (g_dpu_verbose >= 2) {
++			IOLog("SWEET DPU: dsi0+0x%03x=0x%08x\n", off, v);
++		}
++	}
++	IOLog("SWEET DPU: dsi0 0x%08x, %u nonzero words\n", DSI0_PA, found);
++	}
++
++	if (g_dpu.ready) {
++		IOLog("SWEET DPU: flip ready on %s SRC_ADDR=+0x%x YSTRIDE=+0x%x "
++		    "SZ=+0x%x CTL0x%x flush=0x%x %s%s%s sizes %s\n",
++		    g_dpu.sspp_name ? g_dpu.sspp_name : "?",
++		    g_dpu.src_addr_off, g_dpu.src_stride_off, g_dpu.src_size_off,
++		    g_dpu.ctl_bits, g_dpu.flush_mask,
++		    g_dpu.video_mode ? "video" : "cmd-or-idle",
++		    g_dpu.size_enc == SWEET_SIZE_UNKNOWN ? " geom-locked" : "",
++		    g_dpu.orig_src_xy != 0 ? " src-xy-nonzero" : "",
++		    dpu_enc_name());
++	} else {
++		IOLog("SWEET DPU: no SSPP holds the panel PA - flip disabled\n");
++	}
++}
++
++bool
++sweet_display_can_flip(void)
++{
++	return g_dpu.ready && !g_dpu.disabled &&
++	    g_dpu.mdss != 0 && g_dpu.ctl_bits != 0;
++}
++
++/* Put the plane back exactly as the bootloader left it (panel PA, geometry). */
++static void
++dpu_restore(void)
++{
++	if (!g_dpu.ready || g_dpu.mdss == 0) {
++		return;
++	}
++	dpu_wr(g_dpu.mdss, g_dpu.src_size_off, g_dpu.orig_src_size);
++	dpu_wr(g_dpu.mdss, g_dpu.dst_size_off, g_dpu.orig_dst_size);
++	dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, g_dpu.orig_src_xy);
++	dpu_wr(g_dpu.mdss, g_dpu.src_stride_off,
++	    (dpu_rd(g_dpu.mdss, g_dpu.src_stride_off) & 0xffff0000u) |
++	    (g_dpu.orig_stride & 0xffffu));
++	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, g_dpu.orig_pa);
++	dpu_commit();
++	g_dpu.cur_pa = g_dpu.orig_pa;
++	g_dpu.cur_stride = g_dpu.orig_stride;
++	g_dpu.cur_src_size = g_dpu.orig_src_size;
++	/* The origin the bootloader left, not 0: a later crop flip only writes
++	 * SRC_XY when it differs from this. */
++	if (g_dpu.size_enc != SWEET_SIZE_UNKNOWN) {
++		dpu_size_decode(g_dpu.orig_src_xy, g_dpu.size_enc, &g_dpu.cur_x,
++		    &g_dpu.cur_y);
++	} else {
++		g_dpu.cur_x = 0;
++		g_dpu.cur_y = 0;
++	}
++	g_dpu.dirty = 0;
++}
++
++/*
++ * Point the live SSPP at phys (32-bit PA) with the given bytes-per-row and a
++ * source window (origin inside that buffer, size in pixels).
++ *
++ * SRC_ADDR / YSTRIDE0 always move. SRC_SIZE/DST_SIZE only when the window
++ * size differs from what the bootloader programmed - the panel-sized flip
++ * leaves the mixer and any scaler exactly as they were, which is why it
++ * cannot scramble (a wrongly packed SRC_SIZE is what did). SRC_XY only when
++ * the origin differs from the bootloader's. A window that needs geometry the
++ * probe could not decode is refused, never guessed.
++ */
++bool
++sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
++    uint32_t width, uint32_t height)
++{
++	uint32_t ystride, size, latched;
++
++	if (!sweet_display_can_flip() || phys == 0 || width == 0 || height == 0) {
++		return false;
++	}
++	if (phys == g_dpu.cur_pa && stride == g_dpu.cur_stride &&
++	    x == g_dpu.cur_x && y == g_dpu.cur_y &&
++	    width == g_dpu.cur_w && height == g_dpu.cur_h) {
++		return true;
++	}
++	if (width != g_dpu.cur_w || height != g_dpu.cur_h) {
++		if (g_dpu.size_enc == SWEET_SIZE_UNKNOWN) {
++			return false;
++		}
++		size = dpu_size_pack(width, height, g_dpu.size_enc);
++		dpu_wr(g_dpu.mdss, g_dpu.src_size_off, size);
++		dpu_wr(g_dpu.mdss, g_dpu.dst_size_off, size);
++		g_dpu.cur_src_size = size;
++		g_dpu.cur_w = width;
++		g_dpu.cur_h = height;
++		g_dpu.dirty = 1;
++	}
++	if (x != g_dpu.cur_x || y != g_dpu.cur_y) {
++		if (g_dpu.size_enc == SWEET_SIZE_UNKNOWN) {
++			return false;
++		}
++		dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, dpu_xy_pack(x, y, g_dpu.size_enc));
++		g_dpu.cur_x = x;
++		g_dpu.cur_y = y;
++		g_dpu.dirty = 1;
++	}
++	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, phys);
++	if (stride != 0 && stride != g_dpu.cur_stride) {
++		ystride = dpu_rd(g_dpu.mdss, g_dpu.src_stride_off);
++		ystride = (ystride & 0xffff0000u) | (stride & 0xffffu);
++		dpu_wr(g_dpu.mdss, g_dpu.src_stride_off, ystride);
++		g_dpu.cur_stride = stride;
++		g_dpu.dirty = 1;
++	}
++	dpu_commit();
++
++	latched = dpu_rd(g_dpu.mdss, g_dpu.src_addr_off);
++	if (latched != phys) {
++		IOLog("SWEET DPU: flip did not stick (0x%08x != 0x%08x), "
++		    "restoring and disabling\n", latched, phys);
++		dpu_restore();
++		g_dpu.disabled = 1;
++		return false;
++	}
++	g_dpu.cur_pa = phys;
++	g_dpu.dirty = 1;
++	return true;
++}
++
++void
++sweet_display_flip_reset(void)
++{
++	if (!g_dpu.ready || g_dpu.orig_pa == 0 || !g_dpu.dirty) {
++		return;
++	}
++	dpu_restore();
++}
++
++#else /* !ARM64_BOARD_CONFIG_SWEET */
++
++void
++sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
++    uint32_t fb_width, uint32_t fb_height)
++{
++	(void)fb_phys;
++	(void)fb_stride;
++	(void)fb_width;
++	(void)fb_height;
++}
++
++bool
++sweet_display_can_flip(void)
++{
++	return false;
++}
++
++bool
++sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
++    uint32_t width, uint32_t height)
++{
++	(void)phys;
++	(void)stride;
++	(void)x;
++	(void)y;
++	(void)width;
++	(void)height;
++	return false;
++}
++
++void
++sweet_display_flip_reset(void)
++{
++}
++
++#endif /* SWEET */
+--- a/iokit/Kernel/arm/SweetDisplay.h
++++ b/iokit/Kernel/arm/SweetDisplay.h
+@@ -1,54 +1,57 @@
+-/*
+- * SweetDisplay.h: DPU (MDSS/SDE) probe + zero-copy flip for davinci/SWEET.
+- *
+- * The bootloader leaves the display controller scanning the panel
+- * framebuffer. sweet_display_probe() reads the live pipeline (never writes
+- * unless sweetfb_flip is later used) and remembers the SSPP SRC_ADDR /
+- * YSTRIDE / SRC_XY / SRC_SIZE and the live CTLs. sweet_display_flip() then
+- * points that layer at a new physically contiguous buffer - a present with
+- * no 10 MB CPU copy. See docs/GPU.md.
+- */
+-#ifndef _SWEET_DISPLAY_H_
+-#define _SWEET_DISPLAY_H_
+-
+-#include <sys/types.h>
+-#include <stdbool.h>
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-
+-/*
+- * fb_phys/fb_stride describe the panel memory XNU draws into; the probe
+- * looks for those values in the register dump to name SRC_ADDR / YSTRIDE.
+- * Boot-arg sweetdpu: 0 = off, 1 = probe (default).
+- */
+-void sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
+-    uint32_t fb_width, uint32_t fb_height);
+-
+-/* True after a successful probe that found the live layer's SRC_ADDR. */
+-bool sweet_display_can_flip(void);
+-
+-/*
+- * Point the live SSPP at phys (32-bit PA) with the given bytes-per-row and
+- * source window. (x, y) is the origin of the panel-sized window inside the
+- * buffer (0,0 for an exact panel surface; the centered crop for a larger
+- * logical surface), width/height default to the panel rect when 0.
+- *
+- * Only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY are written (SRC_SIZE/DST_SIZE only
+- * when the window differs from the bootloader's), then every live CTL is
+- * flushed and kicked. Returns false if the probe did not find a layer, the
+- * DPU mapping is gone, the size encoding could not be derived for a window
+- * change, or the write did not latch (the plane is restored first).
+- */
+-bool sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
+-    uint32_t width, uint32_t height);
+-
+-/* Restore the original ABL splash PA (for power-off fade / panic path). */
+-void sweet_display_flip_reset(void);
+-
+-#ifdef __cplusplus
+-}
+-#endif
+-
+-#endif /* _SWEET_DISPLAY_H_ */
++/*
++ * SweetDisplay.h: DPU (MDSS/SDE) probe + zero-copy flip for davinci/SWEET.
++ *
++ * The bootloader leaves the display controller scanning the panel
++ * framebuffer. sweet_display_probe() reads the live pipeline (never writes
++ * unless sweetfb_flip is later used) and remembers the SSPP SRC_ADDR /
++ * YSTRIDE / SRC_XY / SRC_SIZE and the live CTLs. sweet_display_flip() then
++ * points that layer at a new physically contiguous buffer - a present with
++ * no 10 MB CPU copy. See docs/GPU.md.
++ */
++#ifndef _SWEET_DISPLAY_H_
++#define _SWEET_DISPLAY_H_
++
++#include <sys/types.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * fb_phys/fb_stride describe the panel memory XNU draws into; the probe
++ * looks for those values in the register dump to name SRC_ADDR / YSTRIDE.
++ * Boot-arg sweetdpu: 0 = off, 1 = probe (default).
++ */
++void sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
++    uint32_t fb_width, uint32_t fb_height);
++
++/* True after a successful probe that found the live layer's SRC_ADDR. */
++bool sweet_display_can_flip(void);
++
++/*
++ * Point the live SSPP at phys (32-bit PA) with the given bytes-per-row and
++ * source window. (x, y) is the origin of the panel-sized window inside the
++ * buffer (0,0 for an exact panel surface; the centered crop for a larger
++ * logical surface), width/height default to the panel rect when 0.
++ *
++ * Only SRC_ADDR and SRC_YSTRIDE0 are written for a panel-sized flip;
++ * SRC_SIZE/DST_SIZE change only when the window size differs from the
++ * bootloader's and SRC_XY only when the origin does, so the mixer, format and
++ * any scaler stay untouched. Every live CTL is then flushed and kicked.
++ * Returns false if the probe did not find a layer, the DPU mapping is gone, the
++ * size encoding could not be derived for a window change, or the write did not
++ * latch (the plane is restored first).
++ */
++bool sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
++    uint32_t width, uint32_t height);
++
++/* Restore the original ABL splash PA and geometry. Cheap no-op when the plane
++ * was never moved, so the CPU-copy path can call it on every present. */
++void sweet_display_flip_reset(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _SWEET_DISPLAY_H_ */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1,999 +1,1019 @@
+-/*
+- * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
+- * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
+- * itself) as the main display, driven by CoreAnimation's CPU renderer.
+- *
+- * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
+- * device_type "display-subsystem", waits for that many services matching
+- * IOServiceMatching("IOMobileFramebuffer"), opens each with type 0 and
+- * reads canvas-width/canvas-height from the service's provider. The class
+- * here (AppleCLCD, an IOMobileFramebuffer) matches the /arm-io/disp0 nub.
+- *
+- * User client selectors used by CoreAnimation:
+- *   3  GetLayerDefaultSurface [layer, ?] -> [IOSurface port name]
+- *   4  SwapBegin -> [swap id]
+- *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
+- *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
+- *      +0x104 enabled layer mask
+- *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+- *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+- *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
+- *      the panel itself stays powered (AMOLED black pixels are off).
+- *   18 IsMainDisplay,
+- *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+- * Everything else is accepted and logged once.
+- *
+- * SwapEnd only records the frame. A second 60 Hz timer, on its own work loop,
+- * copies the enabled layers' surfaces into the panel memory (no scaling, CPU
+- * copy) and stretches its period to whatever the measured copy cost allows
+- * (boot-arg sweetfb_hz caps the rate). Vsync (notification type 5) is a
+- * separate 60 Hz timer that only sends (count, mach_absolute_time, 0) as
+- * 32-bit halves to clients that enabled it, through the port they registered
+- * (IOConnectSetNotificationPort), so a slow copy cannot delay CoreAnimation's
+- * frame pacing.
+- *
+- * The panel memory itself is published as an IOSurface and returned as the
+- * default framebuffer surface. The kernel text console keeps drawing over
+- * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+- * the first swap on (it still reaches the persistent log; panics draw).
+- *
+- * The copy goes through a cached mapping by default (sweetfb_cache=0 asks
+- * for write-combined instead): a 10 MB frame of write-combined stores is a
+- * 10-20 ms stall, the same frame memcpy'd into cache + dc cvac is about 1 ms.
+- * start() also runs the DPU probe (SweetDisplay.cpp). With sweetfb_flip=1 and
+- * a contiguous layer surface below 4 GB, present becomes SRC_ADDR + CTL flush
+- * instead of the memcpy (CPU fallback stays for anything the probe missed).
+- */
+-#include "SweetDisplay.h"
+-#include "SweetSurface.h"
+-
+-extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+-
+-#if defined(SWEET)
+-#include <IOKit/IOService.h>
+-#include <IOKit/IOUserClient.h>
+-#include <IOKit/IOMemoryDescriptor.h>
+-#include <IOKit/IOKitKeys.h>
+-#include <IOKit/IOLib.h>
+-#include <IOKit/IOLocks.h>
+-#include <IOKit/IOWorkLoop.h>
+-#include <IOKit/IOTimerEventSource.h>
+-#include <IOKit/system.h>
+-#include <pexpert/pexpert.h>
+-#include <kern/clock.h>
+-#include <sys/proc.h>
+-
+-enum {
+-	kSweetFBGetLayerDefaultSurface  = 3,
+-	kSweetFBSwapBegin               = 4,
+-	kSweetFBSwapEnd                 = 5,
+-	kSweetFBSwapWait                = 6,
+-	kSweetFBGetID                   = 7,
+-	kSweetFBGetDisplaySize          = 8,
+-	kSweetFBRequestPowerChange      = 12,
+-	kSweetFBIsMainDisplay           = 18,
+-	kSweetFBGetDotPitch             = 28,
+-	kSweetFBNotifications           = 72,
+-};
+-
+-#define SWEET_FB_SWAP_REC_SIZE          0x46c
+-#define SWEET_FB_LAYERS                 4
+-#define SWEET_FB_NOTIFY_TYPES           8
+-#define SWEET_FB_NOTIFY_VSYNC           5
+-#define SWEET_FB_VSYNC_US               16667
+-#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+-/*
+- * The iOS userland only has status bar / layout data for real iPhone
+- * screens (UIKit: "No status bar visual provider for screen", the red
+- * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2340 part of it is shown on the 1080x2340 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
+- */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
+-#define SWEET_FB_FORMAT_BGRA            0x42475241
+-
+-class IOMobileFramebuffer : public IOService {
+-	OSDeclareDefaultStructors(IOMobileFramebuffer);
+-};
+-
+-OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+-
+-class IOMobileFramebufferUserClient;
+-
+-class AppleCLCD : public IOMobileFramebuffer {
+-	OSDeclareDefaultStructors(AppleCLCD);
+-
+-	IOWorkLoop         *fWorkLoop;         /* vsync notifications */
+-	IOTimerEventSource *fVsync;
+-	IOWorkLoop         *fPresentLoop;      /* panel copies */
+-	IOTimerEventSource *fPresentTimer;
+-	uint64_t            fVsyncCount;
+-
+-	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+-	static void presentFired(OSObject *owner, IOTimerEventSource *sender);
+-
+-public:
+-	uint64_t      fPhys;
+-	uint32_t      fWidth, fHeight, fRowBytes;
+-	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+-	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+-	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+-	IOMemoryMap  *fMap;
+-	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+-	IOLock       *fLock;            /* swaps and client list */
+-	OSArray      *fClients;
+-	uint32_t      fSwapID;
+-	bool          fConsolePaused;
+-	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+-	bool          fDirty;
+-	uint32_t      fPeriodUS;      /* present period cap, from sweetfb_hz */
+-	uint64_t      fPresents;      /* panel copies done */
+-	uint64_t      fCopyUs;        /* duration of the last panel copy */
+-	uint64_t      fFrameBytes;    /* bytes the last present copied */
+-	uint32_t      fCacheMode;     /* 1 = cached panel mapping + dc cvac */
+-	uint32_t      fFlipMode;      /* 1 = DPU SRC_ADDR flip when possible */
+-	uint64_t      fFlips;         /* zero-copy presents */
+-	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	uint32_t      fFadeStep;      /* fade-out steps done while off */
+-
+-	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void addClient(IOMobileFramebufferUserClient *client);
+-	void removeClient(IOMobileFramebufferUserClient *client);
+-	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
+-};
+-
+-OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+-
+-class IOMobileFramebufferUserClient : public IOUserClient {
+-	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+-
+-public:
+-	AppleCLCD          *fFB;
+-	task_t              fTask;
+-	mach_port_t         fPort;
+-	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
+-	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
+-
+-	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+-	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+-	IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
+-	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+-	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+-	    IOExternalMethodDispatch *dispatch, OSObject *target,
+-	    void *reference) APPLE_KEXT_OVERRIDE;
+-	void notify(uint32_t type, const uint64_t *values, uint32_t count);
+-};
+-
+-OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+-
+-bool
+-AppleCLCD::start(IOService *provider)
+-{
+-	PE_Video video;
+-
+-	if (!IOService::start(provider)) {
+-		return false;
+-	}
+-	PE_current_console(&video);
+-	fPhys = video.v_baseAddr;
+-	fWidth = (uint32_t)video.v_width;
+-	fHeight = (uint32_t)video.v_height;
+-	fRowBytes = (uint32_t)video.v_rowBytes;
+-	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+-		IOLog("SWEET FB: no boot framebuffer\n");
+-		return false;
+-	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = fWidth;
+-	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
+-	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+-	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+-	fLock = IOLockAlloc();
+-	fClients = OSArray::withCapacity(4);
+-	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+-	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+-	/*
+-	 * Write-combined stores into the panel run at a few GB/s at best: a
+-	 * 1080x2340 frame then costs several milliseconds per present. A cached
+-	 * mapping plus an explicit clean (dc cvac) is much faster because the
+-	 * copy runs at memory bandwidth; the display controller is not cache
+-	 * coherent, hence the flush in present(). Cached is the default,
+-	 * sweetfb_cache=0 selects the write-combined mapping again.
+-	 */
+-	fCacheMode = 1;
+-	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
+-	/*
+-	 * Splash pool: CA full-screen layers land in the ABL 24 MB carve-out the
+-	 * DPU already scans. Flip defaults ON so present is SRC_ADDR, not memcpy.
+-	 * sweetfb_flip=0 forces the CPU copy path again.
+-	 */
+-	{
+-		/* Two ~12 MB slots in the 24 MB splash: fits 1125x2436 BGRA. */
+-		sweet_surface_set_splash_pool(fPhys, 24u << 20, (24u << 20) / 2);
+-		fFlipMode = 1;
+-		PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
+-	}
+-	if (fCacheMode != 0 && fSurface != NULL) {
+-		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
+-		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
+-		fMap = md != NULL ? md->map(kIOMapCopybackCache) : NULL;
+-		OSSafeReleaseNULL(md);
+-		if (fMap != NULL && fMap->getVirtualAddress() != 0) {
+-			fPixels = (uintptr_t)fMap->getVirtualAddress();
+-			IOLog("SWEET FB: panel copy through a cached mapping + cvac\n");
+-		} else {
+-			fCacheMode = 0;
+-			IOLog("SWEET FB: cached panel mapping failed, keeping write-combined\n");
+-			OSSafeReleaseNULL(fMap);
+-		}
+-	}
+-	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+-		IOLog("SWEET FB: setup failed\n");
+-		OSSafeReleaseNULL(fMap);
+-		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+-		OSSafeReleaseNULL(fWorkLoop);
+-		return false;
+-	}
+-	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+-	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+-		IOLog("SWEET FB: no vsync timer\n");
+-		return false;
+-	}
+-	uint32_t hz = 60;
+-	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fPeriodUS = (hz == 0 || hz > 240) ? SWEET_FB_VSYNC_US : 1000000u / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+-	/*
+-	 * The panel copy gets its own work loop and timer, so the vsync
+-	 * notifications above stay on time whatever a copy costs.
+-	 */
+-	fPresentLoop = IOWorkLoop::workLoop();
+-	fPresentTimer = fPresentLoop != NULL ?
+-	    IOTimerEventSource::timerEventSource(this, &AppleCLCD::presentFired) : NULL;
+-	if (fPresentTimer == NULL ||
+-	    fPresentLoop->addEventSource(fPresentTimer) != kIOReturnSuccess) {
+-		IOLog("SWEET FB: no present timer\n");
+-		return false;
+-	}
+-	fPresentTimer->setTimeoutUS(fPeriodUS);
+-
+-	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+-	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+-	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, "
+-	    "presented as %ux%u, present every %u us, panel %s, flip %s\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS,
+-	    fCacheMode != 0 ? "cached" : "write-combined",
+-	    fFlipMode != 0 ? "on" : "off");
+-	/* Discover the live SSPP; enables sweet_display_flip when found. */
+-	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
+-	if (fFlipMode != 0 && !sweet_display_can_flip()) {
+-		IOLog("SWEET FB: sweetfb_flip=1 but DPU layer not found, CPU copy stays\n");
+-	}
+-	return true;
+-}
+-
+-void
+-AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+-{
+-	AppleCLCD *fb = (AppleCLCD *)owner;
+-	uint64_t now = mach_absolute_time();
+-	uint64_t count = ++fb->fVsyncCount;
+-	uint64_t values[6] = {
+-		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
+-	};
+-
+-	IOLockLock(fb->fLock);
+-	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+-		IOMobileFramebufferUserClient *client =
+-		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+-		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+-	}
+-	IOLockUnlock(fb->fLock);
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+-}
+-
+-/* Microseconds since start, for the present cost report. */
+-static uint32_t
+-sweet_fb_elapsed_us(uint64_t start)
+-{
+-	uint64_t delta = 0;
+-
+-	absolutetime_to_nanoseconds(mach_absolute_time() - start, &delta);
+-	return delta > 1000000000ULL ? 1000000000u : (uint32_t)(delta / 1000);
+-}
+-
+-/*
+- * Clean the lines of a just-written panel region: the display controller is
+- * not cache coherent. dc cvac (clean, keep the line) rather than civac, so a
+- * dirty line someone else holds through another mapping is not discarded.
+- */
+-static void
+-sweet_fb_clean_rows(uintptr_t dst, size_t row, int32_t h, uint32_t stride)
+-{
+-	uint64_t ctr;
+-	size_t line;
+-
+-	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
+-	line = (size_t)4 << ((ctr >> 16) & 0xf);
+-	for (int32_t y = 0; y < h; y++) {
+-		uintptr_t start = dst + (uint64_t)y * stride;
+-		uintptr_t p = start & ~(uintptr_t)(line - 1);
+-		uintptr_t end = start + row;
+-
+-		for (; p < end; p += line) {
+-			__asm__ volatile ("dc cvac, %0" :: "r"(p) : "memory");
+-		}
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
+-
+-/*
+- * Panel copy, on its own work loop. The period follows the measured cost:
+- * a copy may use about a third of the frame period, so a slow mapping
+- * (write-combined stores run at a few GB/s at best) costs update rate
+- * instead of CPU. sweetfb_hz caps the rate from above.
+- */
+-void
+-AppleCLCD::presentFired(OSObject *owner, IOTimerEventSource *sender)
+-{
+-	AppleCLCD *fb = (AppleCLCD *)owner;
+-	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+-	bool dirty, off;
+-	uint32_t step, period;
+-
+-	IOLockLock(fb->fLock);
+-	dirty = fb->fDirty;
+-	if (dirty) {
+-		memcpy(rec, fb->fPending, sizeof(rec));
+-		fb->fDirty = false;
+-	}
+-	off = fb->fPowerOff;
+-	step = fb->fFadeStep;
+-	if (off && step <= 6) {
+-		fb->fFadeStep = step + 1;
+-	}
+-	IOLockUnlock(fb->fLock);
+-
+-	if (off) {
+-		/* Fade must hit the buffer the DPU is scanning. */
+-		if (step == 0 && fb->fFlipMode != 0) {
+-			sweet_display_flip_reset();
+-		}
+-		/* Fade out: halve every channel each step, then black, then idle. */
+-		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels +
+-				    (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+-				}
+-			}
+-			if (fb->fCacheMode != 0) {
+-				sweet_fb_clean_rows(fb->fPixels, (size_t)fb->fWidth * 4,
+-				    (int32_t)fb->fHeight, fb->fRowBytes);
+-			}
+-		}
+-	} else if (dirty) {
+-		uint64_t start = mach_absolute_time();
+-		fb->fFrameBytes = 0;
+-		fb->present(rec);
+-		fb->fCopyUs = sweet_fb_elapsed_us(start);
+-		fb->fPresents++;
+-	}
+-
+-	period = fb->fPeriodUS;
+-	if (fb->fCopyUs * 3 > (uint64_t)period) {
+-		uint64_t want = fb->fCopyUs * 3;
+-		period = (uint32_t)(want > 50000 ? 50000 : want);
+-	}
+-	if ((fb->fPresents % 120) == 0 && fb->fPresents != 0) {
+-		uint64_t mbps = fb->fCopyUs != 0 ?
+-		    (fb->fFrameBytes * 1000000ULL) / (fb->fCopyUs * (1024ULL * 1024ULL)) : 0;
+-		IOLog("SWEET FB: present %llu %u us %llu KB %llu MB/s every %u us "
+-		    "(flips %llu)\n",
+-		    (unsigned long long)fb->fPresents, (uint32_t)fb->fCopyUs,
+-		    (unsigned long long)(fb->fFrameBytes / 1024),
+-		    (unsigned long long)mbps, period,
+-		    (unsigned long long)fb->fFlips);
+-	}
+-	sender->setTimeoutUS(period);
+-}
+-
+-void
+-AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+-{
+-	IOLockLock(fLock);
+-	fClients->setObject(client);
+-	IOLockUnlock(fLock);
+-}
+-
+-void
+-AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+-{
+-	IOLockLock(fLock);
+-	unsigned int i = fClients->getNextIndexOfObject(client, 0);
+-	if (i != (unsigned int)-1) {
+-		fClients->removeObject(i);
+-	}
+-	IOLockUnlock(fLock);
+-}
+-
+-static uint32_t
+-get32(const uint8_t *p, uint32_t off)
+-{
+-	uint32_t v;
+-	memcpy(&v, p + off, 4);
+-	return v;
+-}
+-
+-static uint32_t sweet_fb_swaps_logged;
+-static uint64_t sweet_fb_swap_count;
+-
+-/*
+- * A swap only records the frame: copying 10 MB into the panel on every swap
+- * (backboardd presents at 60 Hz) took the whole CPU, and doing it on the
+- * vsync work loop also delayed the notifications back to CoreAnimation.
+- * presentFired() does the copy and the cost report; swap() stays a small
+- * memcpy under the lock.
+- */
+-void
+-AppleCLCD::swap(const uint8_t *rec)
+-{
+-	IOLockLock(fLock);
+-	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
+-	IOLockUnlock(fLock);
+-	if ((++sweet_fb_swap_count % 1000) == 0) {
+-		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+-	}
+-}
+-
+-/*
+- * Zero-copy present: point the live SSPP at the CA surface and let the DPU
+- * fetch it. The bootloader's pipeline is kept (same format, same panel-sized
+- * source window, same mixers); only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY move,
+- * so a bad guess costs one frame instead of the panel - and sweet_display_*
+- * restores the splash buffer and disables the flip if the write does not
+- * latch.
+- *
+- * The window is exactly the one the CPU crop-copy below uses: a full panel
+- * rect, cropped out of a larger logical surface when CoreAnimation draws
+- * 1125x2436 for the 1080x2340 panel. That is what makes native and logical
+- * mode flip the same way, and it is why the surface pitch (4320/4352/4608)
+- * must be programmed as YSTRIDE instead of the ABL's 4320.
+- */
+-static bool
+-sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
+-{
+-	uint32_t mask = get32(rec, 0x104);
+-	uint32_t found = 0, id = 0;
+-	int32_t sx, sy, ldx, ldy, lw, lh;
+-	uint32_t crop_x, crop_y;
+-	const uint8_t *a, *b;
+-	SweetSurface *s;
+-	uint64_t phys;
+-	uintptr_t src;
+-	static uint32_t flip_logged;
+-
+-	if (fb->fFlipMode == 0 || !sweet_display_can_flip()) {
+-		return false;
+-	}
+-	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+-		if (!(mask & (1u << layer))) {
+-			continue;
+-		}
+-		id = get32(rec, 0x54 + 4 * layer);
+-		if (id == 0) {
+-			continue;
+-		}
+-		found++;
+-		if (found > 1) {
+-			return false;
+-		}
+-		a = rec + 0x64 + 16 * layer;
+-		b = rec + 0xc4 + 16 * layer;
+-		sx = (int32_t)get32(a, 0);
+-		sy = (int32_t)get32(a, 4);
+-		ldx = (int32_t)get32(b, 0);
+-		ldy = (int32_t)get32(b, 4);
+-		lw = (int32_t)get32(b, 8);
+-		lh = (int32_t)get32(b, 12);
+-	}
+-	if (found != 1) {
+-		return false;
+-	}
+-	s = sweet_surface_copy(id);
+-	if (s == NULL || s == fb->fSurface) {
+-		OSSafeReleaseNULL(s);
+-		return false;
+-	}
+-	if (lw <= 0 || lh <= 0) {
+-		lw = (int32_t)s->width;
+-		lh = (int32_t)s->height;
+-	}
+-	if (sx < 0 || sy < 0 ||
+-	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+-		s->release();
+-		return false;
+-	}
+-
+-	crop_x = 0;
+-	crop_y = 0;
+-	if (ldx == 0 && ldy == 0 &&
+-	    lw == (int32_t)fb->fLogicalW && lh == (int32_t)fb->fLogicalH &&
+-	    sx == 0 && sy == 0 &&
+-	    s->width >= fb->fOffX + (int32_t)fb->fWidth &&
+-	    s->height >= fb->fOffY + (int32_t)fb->fHeight) {
+-		/* Logical-size layer: the panel is its centered window. */
+-		crop_x = (uint32_t)fb->fOffX;
+-		crop_y = (uint32_t)fb->fOffY;
+-	} else if (ldx == fb->fOffX && ldy == fb->fOffY &&
+-	    lw == (int32_t)fb->fWidth && lh == (int32_t)fb->fHeight &&
+-	    s->width >= (uint32_t)sx + fb->fWidth &&
+-	    s->height >= (uint32_t)sy + fb->fHeight) {
+-		/* Dest is the panel itself; the record may still offset the source. */
+-		crop_x = (uint32_t)sx;
+-		crop_y = (uint32_t)sy;
+-	} else {
+-		s->release();
+-		return false;
+-	}
+-
+-	phys = sweet_surface_phys(s);
+-	src = s->kernelAddress();
+-	if (phys == 0 || phys > 0xffffffffull || src == 0) {
+-		s->release();
+-		return false;
+-	}
+-	if (s->bytesPerRow == 0 || s->bytesPerRow > 0xffffu) {
+-		s->release();
+-		return false;
+-	}
+-	if (s->memory == NULL ||
+-	    (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+-		s->release();
+-		return false;
+-	}
+-	sweet_fb_clean_rows(src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
+-	    (uint64_t)crop_x * 4u, (size_t)fb->fWidth * 4u,
+-	    (int32_t)fb->fHeight, s->bytesPerRow);
+-	if (!sweet_display_flip((uint32_t)phys, s->bytesPerRow, crop_x, crop_y,
+-	    fb->fWidth, fb->fHeight)) {
+-		s->release();
+-		return false;
+-	}
+-	fb->fFlips++;
+-	fb->fFrameBytes = 0;
+-	if (flip_logged < 8) {
+-		flip_logged++;
+-		IOLog("SWEET FB: flip surface %u pa 0x%llx crop %u,%u stride %u "
+-		    "panel %ux%u\n",
+-		    s->id, (unsigned long long)phys, crop_x, crop_y,
+-		    s->bytesPerRow, fb->fWidth, fb->fHeight);
+-	}
+-	s->release();
+-	return true;
+-}
+-
+-/*
+- * Hot path when flip cannot run: CA's 1125x2436 layer -> copy only the
+- * centered panel window into the ABL buffer the DPU already scans.
+- * Beats the generic clipper (less branches, one tight row loop).
+- */
+-static bool
+-sweet_fb_try_crop_copy(AppleCLCD *fb, const uint8_t *rec)
+-{
+-	uint32_t mask = get32(rec, 0x104);
+-	uint32_t found = 0, id = 0;
+-	int32_t sx, sy, ldx, ldy, lw, lh;
+-	uint32_t crop_x, crop_y;
+-	const uint8_t *a, *b;
+-	SweetSurface *s;
+-	uintptr_t src, dst;
+-	const uint8_t *from;
+-	size_t row;
+-	static uint32_t crop_logged;
+-
+-	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+-		if (!(mask & (1u << layer))) {
+-			continue;
+-		}
+-		id = get32(rec, 0x54 + 4 * layer);
+-		if (id == 0) {
+-			continue;
+-		}
+-		found++;
+-		if (found > 1) {
+-			return false;
+-		}
+-		a = rec + 0x64 + 16 * layer;
+-		b = rec + 0xc4 + 16 * layer;
+-		sx = (int32_t)get32(a, 0);
+-		sy = (int32_t)get32(a, 4);
+-		ldx = (int32_t)get32(b, 0);
+-		ldy = (int32_t)get32(b, 4);
+-		lw = (int32_t)get32(b, 8);
+-		lh = (int32_t)get32(b, 12);
+-	}
+-	if (found != 1 || fb->fPixels == 0) {
+-		return false;
+-	}
+-	s = sweet_surface_copy(id);
+-	if (s == NULL || s == fb->fSurface) {
+-		OSSafeReleaseNULL(s);
+-		return false;
+-	}
+-	if (lw <= 0 || lh <= 0) {
+-		lw = (int32_t)s->width;
+-		lh = (int32_t)s->height;
+-	}
+-	if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+-		s->release();
+-		return false;
+-	}
+-
+-	if (ldx == 0 && ldy == 0 &&
+-	    lw == (int32_t)fb->fLogicalW && lh == (int32_t)fb->fLogicalH &&
+-	    sx == 0 && sy == 0) {
+-		crop_x = (uint32_t)fb->fOffX;
+-		crop_y = (uint32_t)fb->fOffY;
+-	} else if (ldx == fb->fOffX && ldy == fb->fOffY &&
+-	    lw == (int32_t)fb->fWidth && lh == (int32_t)fb->fHeight) {
+-		crop_x = (uint32_t)sx;
+-		crop_y = (uint32_t)sy;
+-	} else {
+-		s->release();
+-		return false;
+-	}
+-	if (s->width < crop_x + fb->fWidth || s->height < crop_y + fb->fHeight) {
+-		s->release();
+-		return false;
+-	}
+-	src = s->kernelAddress();
+-	if (src == 0) {
+-		s->release();
+-		return false;
+-	}
+-
+-	row = (size_t)fb->fWidth * 4u;
+-	dst = fb->fPixels;
+-	from = (const uint8_t *)(src + s->offset +
+-	    (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u);
+-	if (s->bytesPerRow == fb->fRowBytes && crop_x == 0) {
+-		memcpy((void *)dst, from, row * (size_t)fb->fHeight);
+-	} else {
+-		for (uint32_t y = 0; y < fb->fHeight; y++) {
+-			memcpy((void *)(dst + (uint64_t)y * fb->fRowBytes),
+-			    from + (uint64_t)y * s->bytesPerRow, row);
+-		}
+-	}
+-	fb->fFrameBytes = (uint64_t)row * fb->fHeight;
+-	if (fb->fCacheMode != 0) {
+-		sweet_fb_clean_rows(dst, row, (int32_t)fb->fHeight, fb->fRowBytes);
+-	}
+-	if (crop_logged < 4) {
+-		crop_logged++;
+-		IOLog("SWEET FB: crop-copy surface %u %ux%u -> panel %ux%u "
+-		    "(%u KB)\n",
+-		    s->id, s->width, s->height, fb->fWidth, fb->fHeight,
+-		    (uint32_t)(fb->fFrameBytes / 1024u));
+-	}
+-	s->release();
+-	return true;
+-}
+-
+-/* Copy each enabled layer's surface into the panel memory (no scaling). */
+-void
+-AppleCLCD::present(const uint8_t *rec)
+-{
+-	uint32_t mask = get32(rec, 0x104);
+-
+-	if (!fConsolePaused) {
+-		int quiet = 0;
+-		fConsolePaused = true;
+-		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+-			 * writes the read-only-late cons_ops_index and panics. */
+-			sweet_console_muted = 1;
+-		}
+-	}
+-
+-	if (sweet_fb_try_flip(this, rec)) {
+-		return;
+-	}
+-	if (sweet_fb_try_crop_copy(this, rec)) {
+-		return;
+-	}
+-
+-	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+-		uint32_t id = get32(rec, 0x54 + 4 * layer);
+-		const uint8_t *a = rec + 0x64 + 16 * layer;
+-		const uint8_t *b = rec + 0xc4 + 16 * layer;
+-		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
+-		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
+-		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
+-
+-		if (!(mask & (1u << layer)) || id == 0) {
+-			continue;
+-		}
+-		SweetSurface *s = sweet_surface_copy(id);
+-		if (sweet_fb_swaps_logged < 16) {
+-			sweet_fb_swaps_logged++;
+-			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+-			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+-			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+-			    get32(a, 12), dx, dy, w, h);
+-		}
+-		if (s == NULL || s == fSurface) {
+-			OSSafeReleaseNULL(s);
+-			continue;
+-		}
+-		uintptr_t src = s->kernelAddress();
+-		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+-		if (w <= 0 || h <= 0) {
+-			w = (int32_t)s->width;
+-			h = (int32_t)s->height;
+-		}
+-		if (sx < 0 || sy < 0) {
+-			sx = sy = 0;
+-		}
+-		if (dx < 0 || dy < 0) {
+-			dx = dy = 0;
+-		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
+-		if (dx < 0) {
+-			sx -= dx;
+-			w += dx;
+-			dx = 0;
+-		}
+-		if (dy < 0) {
+-			sy -= dy;
+-			h += dy;
+-			dy = 0;
+-		}
+-		if (w > (int32_t)s->width - sx) {
+-			w = (int32_t)s->width - sx;
+-		}
+-		if (h > (int32_t)s->height - sy) {
+-			h = (int32_t)s->height - sy;
+-		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
+-		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
+-		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+-		    (uint64_t)(sx + w) * 4;
+-		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-		    s->memory == NULL || last > s->memory->getLength()) {
+-			src = 0;
+-		}
+-		if (src != 0 && bpe == 4) {
+-			size_t row = (size_t)w * 4;
+-			uintptr_t dst = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
+-			const uint8_t *from = (const uint8_t *)(src + s->offset +
+-			    (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4);
+-
+-			fFrameBytes += (uint64_t)row * (uint64_t)h;
+-			if (row == fRowBytes && row == s->bytesPerRow) {
+-				/* Full-width layer: one big memcpy beats per-row calls. */
+-				memcpy((void *)dst, from, row * (size_t)h);
+-			} else {
+-				for (int32_t y = 0; y < h; y++) {
+-					memcpy((void *)(dst + (uint64_t)y * fRowBytes),
+-					    from + (uint64_t)y * s->bytesPerRow, row);
+-				}
+-			}
+-			if (fCacheMode != 0) {
+-				sweet_fb_clean_rows(dst, row, h, fRowBytes);
+-			}
+-		}
+-		s->release();
+-	}
+-}
+-
+-bool
+-IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+-{
+-	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+-		return false;
+-	}
+-	fTask = owningTask;
+-	return true;
+-}
+-
+-bool
+-IOMobileFramebufferUserClient::start(IOService *provider)
+-{
+-	fFB = OSDynamicCast(AppleCLCD, provider);
+-	if (fFB == NULL || !IOUserClient::start(provider)) {
+-		return false;
+-	}
+-	fFB->addClient(this);
+-	return true;
+-}
+-
+-IOReturn
+-IOMobileFramebufferUserClient::clientClose(void)
+-{
+-	if (fFB != NULL) {
+-		fFB->removeClient(this);
+-		IOLockLock(fFB->fLock);
+-		mach_port_t old = fPort;
+-		fPort = MACH_PORT_NULL;
+-		IOLockUnlock(fFB->fLock);
+-		if (old != MACH_PORT_NULL) {
+-			releaseNotificationPort(old);
+-		}
+-	}
+-	terminate();
+-	return kIOReturnSuccess;
+-}
+-
+-IOReturn
+-IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, __unused UInt32 type,
+-    __unused io_user_reference_t refCon)
+-{
+-	mach_port_t old;
+-	IOLockLock(fFB->fLock);
+-	old = fPort;
+-	fPort = port;
+-	IOLockUnlock(fFB->fLock);
+-	if (old != MACH_PORT_NULL) {
+-		releaseNotificationPort(old);
+-	}
+-	return kIOReturnSuccess;
+-}
+-
+-/* Called with the framebuffer lock held. */
+-void
+-IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uint32_t count)
+-{
+-	OSAsyncReference64 ref;
+-
+-	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
+-		return;
+-	}
+-	bzero(ref, sizeof(ref));
+-	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
+-	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
+-	    kIOUserNotifyOptionCanDrop);
+-}
+-
+-static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+-
+-IOReturn
+-IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+-    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+-    __unused void *reference)
+-{
+-	IOReturn ret = kIOReturnSuccess;
+-	uint64_t out[2] = { 0, 0 };
+-	uint32_t outCount = 0;
+-
+-	switch (selector) {
+-	case kSweetFBGetLayerDefaultSurface:
+-		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
+-		outCount = 1;
+-		break;
+-	case kSweetFBSwapBegin:
+-		IOLockLock(fFB->fLock);
+-		out[0] = ++fFB->fSwapID;
+-		IOLockUnlock(fFB->fLock);
+-		outCount = 1;
+-		break;
+-	case kSweetFBSwapEnd: {
+-		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+-		if (args->structureInputDescriptor != NULL ||
+-		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
+-			ret = kIOReturnBadArgument;
+-			break;
+-		}
+-		memcpy(rec, args->structureInput, sizeof(rec));
+-		fFB->swap(rec);
+-		break;
+-	}
+-	case kSweetFBGetID:
+-		out[0] = 0;
+-		outCount = 1;
+-		break;
+-	case kSweetFBGetDisplaySize:
+-		out[0] = fFB->fLogicalW;
+-		out[1] = fFB->fLogicalH;
+-		outCount = 2;
+-		break;
+-	case kSweetFBIsMainDisplay:
+-		out[0] = 1;
+-		outCount = 1;
+-		break;
+-	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
+-		outCount = 1;
+-		break;
+-	case kSweetFBNotifications:
+-		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+-			uint32_t type = (uint32_t)args->scalarInput[2];
+-			IOLockLock(fFB->fLock);
+-			fFunc[type] = args->scalarInput[0];
+-			fRefcon[type] = args->scalarInput[1];
+-			IOLockUnlock(fFB->fLock);
+-			char name[32];
+-			proc_selfname(name, sizeof(name));
+-			IOLog("SWEET FB: %s notifications type %u %s\n", name, type,
+-			    args->scalarInput[0] ? "on" : "off");
+-		}
+-		break;
+-	case kSweetFBRequestPowerChange:
+-		if (args->scalarInputCount >= 1) {
+-			bool off = args->scalarInput[0] == 0;
+-			IOLockLock(fFB->fLock);
+-			if (off != fFB->fPowerOff) {
+-				fFB->fPowerOff = off;
+-				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
+-			}
+-			IOLockUnlock(fFB->fLock);
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+-		}
+-		break;
+-	case kSweetFBSwapWait: {
+-		/*
+-		 * Returns at once: whether CoreAnimation passes a swap id (and a
+-		 * timeout) here decides whether blocking would pace the present
+-		 * loop better. Log the first calls, do not guess the ABI.
+-		 */
+-		static uint32_t sweet_fb_wait_logged;
+-		if (sweet_fb_wait_logged < 8) {
+-			sweet_fb_wait_logged++;
+-			char name[32];
+-			proc_selfname(name, sizeof(name));
+-			IOLog("SWEET FB: %s SwapWait in %u %llu %llu %llu (presented %llu)\n",
+-			    name, args->scalarInputCount,
+-			    args->scalarInputCount > 0 ? (unsigned long long)args->scalarInput[0] : 0ULL,
+-			    args->scalarInputCount > 1 ? (unsigned long long)args->scalarInput[1] : 0ULL,
+-			    args->scalarInputCount > 2 ? (unsigned long long)args->scalarInput[2] : 0ULL,
+-			    (unsigned long long)fFB->fPresents);
+-		}
+-		break;
+-	}
+-	default:
+-		break;
+-	}
+-
+-	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+-		args->scalarOutput[i] = i < outCount ? out[i] : 0;
+-	}
+-	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+-		bzero(args->structureOutput, args->structureOutputSize);
+-	}
+-	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+-		if (selector < 64) {
+-			sweet_fb_logged |= 1ULL << selector;
+-		}
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-		    args->scalarInputCount, args->structureInputSize,
+-		    args->scalarOutputCount, args->structureOutputSize, ret);
+-	}
+-	return ret;
+-}
+-#endif /* SWEET */
++/*
++ * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
++ * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
++ * itself) as the main display, driven by CoreAnimation's CPU renderer.
++ *
++ * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
++ * device_type "display-subsystem", waits for that many services matching
++ * IOServiceMatching("IOMobileFramebuffer"), opens each with type 0 and
++ * reads canvas-width/canvas-height from the service's provider. The class
++ * here (AppleCLCD, an IOMobileFramebuffer) matches the /arm-io/disp0 nub.
++ *
++ * User client selectors used by CoreAnimation:
++ *   3  GetLayerDefaultSurface [layer, ?] -> [IOSurface port name]
++ *   4  SwapBegin -> [swap id]
++ *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
++ *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
++ *      +0x104 enabled layer mask
++ *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
++ *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
++ *      button / auto-lock), else on. Off fades the panel out over a few
++ *      vsyncs (halving each pixel) and keeps it black until on again;
++ *      the panel itself stays powered (AMOLED black pixels are off).
++ *   18 IsMainDisplay,
++ *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
++ * Everything else is accepted and logged once.
++ *
++ * SwapEnd only records the frame. A second 60 Hz timer, on its own work loop,
++ * copies the enabled layers' surfaces into the panel memory (no scaling, CPU
++ * copy) and stretches its period to whatever the measured copy cost allows
++ * (boot-arg sweetfb_hz caps the rate). Vsync (notification type 5) is a
++ * separate 60 Hz timer that only sends (count, mach_absolute_time, 0) as
++ * 32-bit halves to clients that enabled it, through the port they registered
++ * (IOConnectSetNotificationPort), so a slow copy cannot delay CoreAnimation's
++ * frame pacing.
++ *
++ * The panel memory itself is published as an IOSurface and returned as the
++ * default framebuffer surface. The kernel text console keeps drawing over
++ * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
++ * the first swap on (it still reaches the persistent log; panics draw).
++ *
++ * The copy goes through a cached mapping by default (sweetfb_cache=0 asks
++ * for write-combined instead): a 10 MB frame of write-combined stores is a
++ * 10-20 ms stall, the same frame memcpy'd into cache + dc cvac is about 1 ms.
++ * start() also runs the DPU probe (SweetDisplay.cpp). With sweetfb_flip=1 and
++ * a contiguous layer surface below 4 GB, present becomes SRC_ADDR + CTL flush
++ * instead of the memcpy (CPU fallback stays for anything the probe missed).
++ */
++#include "SweetDisplay.h"
++#include "SweetSurface.h"
++
++extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/system.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <sys/proc.h>
++
++enum {
++	kSweetFBGetLayerDefaultSurface  = 3,
++	kSweetFBSwapBegin               = 4,
++	kSweetFBSwapEnd                 = 5,
++	kSweetFBSwapWait                = 6,
++	kSweetFBGetID                   = 7,
++	kSweetFBGetDisplaySize          = 8,
++	kSweetFBRequestPowerChange      = 12,
++	kSweetFBIsMainDisplay           = 18,
++	kSweetFBGetDotPitch             = 28,
++	kSweetFBNotifications           = 72,
++};
++
++#define SWEET_FB_SWAP_REC_SIZE          0x46c
++#define SWEET_FB_LAYERS                 4
++#define SWEET_FB_NOTIFY_TYPES           8
++#define SWEET_FB_NOTIFY_VSYNC           5
++#define SWEET_FB_VSYNC_US               16667
++#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++/*
++ * The iOS userland only has status bar / layout data for real iPhone
++ * screens (UIKit: "No status bar visual provider for screen", the red
++ * rdar://45025538 bar for 360x800 points). The display is therefore
++ * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
++ * centered 1080x2340 part of it is shown on the 1080x2340 panel.
++ * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ */
++#define SWEET_FB_LOGICAL_W              1125
++#define SWEET_FB_LOGICAL_H              2436
++#define SWEET_FB_FORMAT_BGRA            0x42475241
++
++class IOMobileFramebuffer : public IOService {
++	OSDeclareDefaultStructors(IOMobileFramebuffer);
++};
++
++OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
++
++class IOMobileFramebufferUserClient;
++
++class AppleCLCD : public IOMobileFramebuffer {
++	OSDeclareDefaultStructors(AppleCLCD);
++
++	IOWorkLoop         *fWorkLoop;         /* vsync notifications */
++	IOTimerEventSource *fVsync;
++	IOWorkLoop         *fPresentLoop;      /* panel copies */
++	IOTimerEventSource *fPresentTimer;
++	uint64_t            fVsyncCount;
++
++	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void presentFired(OSObject *owner, IOTimerEventSource *sender);
++
++public:
++	uint64_t      fPhys;
++	uint32_t      fWidth, fHeight, fRowBytes;
++	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
++	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	IOMemoryMap  *fMap;
++	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
++	IOLock       *fLock;            /* swaps and client list */
++	OSArray      *fClients;
++	uint32_t      fSwapID;
++	bool          fConsolePaused;
++	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	bool          fDirty;
++	uint32_t      fPeriodUS;      /* present period cap, from sweetfb_hz */
++	uint64_t      fPresents;      /* panel copies done */
++	uint64_t      fCopyUs;        /* duration of the last panel copy */
++	uint64_t      fFrameBytes;    /* bytes the last present copied */
++	uint32_t      fCacheMode;     /* 1 = cached panel mapping + dc cvac */
++	uint32_t      fFlipMode;      /* 1 = DPU SRC_ADDR flip when possible */
++	uint64_t      fFlips;         /* zero-copy presents */
++	bool          fPowerOff;      /* RequestPowerChange(0) */
++	uint32_t      fFadeStep;      /* fade-out steps done while off */
++
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void addClient(IOMobileFramebufferUserClient *client);
++	void removeClient(IOMobileFramebufferUserClient *client);
++	void swap(const uint8_t *rec);
++	void present(const uint8_t *rec);
++};
++
++OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
++
++class IOMobileFramebufferUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
++
++public:
++	AppleCLCD          *fFB;
++	task_t              fTask;
++	mach_port_t         fPort;
++	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
++	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
++
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
++	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++	void notify(uint32_t type, const uint64_t *values, uint32_t count);
++};
++
++OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
++
++bool
++AppleCLCD::start(IOService *provider)
++{
++	PE_Video video;
++
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	PE_current_console(&video);
++	fPhys = video.v_baseAddr;
++	fWidth = (uint32_t)video.v_width;
++	fHeight = (uint32_t)video.v_height;
++	fRowBytes = (uint32_t)video.v_rowBytes;
++	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
++		IOLog("SWEET FB: no boot framebuffer\n");
++		return false;
++	}
++	int native = 0;
++	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	fLogicalW = fWidth;
++	fLogicalH = fHeight;
++	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++		fLogicalW = SWEET_FB_LOGICAL_W;
++		fLogicalH = SWEET_FB_LOGICAL_H;
++	}
++	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
++	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fLock = IOLockAlloc();
++	fClients = OSArray::withCapacity(4);
++	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	/*
++	 * Write-combined stores into the panel run at a few GB/s at best: a
++	 * 1080x2340 frame then costs several milliseconds per present. A cached
++	 * mapping plus an explicit clean (dc cvac) is much faster because the
++	 * copy runs at memory bandwidth; the display controller is not cache
++	 * coherent, hence the flush in present(). Cached is the default,
++	 * sweetfb_cache=0 selects the write-combined mapping again.
++	 */
++	fCacheMode = 1;
++	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
++	/*
++	 * Splash pool: CA full-screen layers land in the ABL 24 MB carve-out the
++	 * DPU already scans. Flip defaults ON so present is SRC_ADDR, not memcpy.
++	 * sweetfb_flip=0 forces the CPU copy path again.
++	 */
++	{
++		/* Two ~12 MB slots in the 24 MB splash: fits 1125x2436 BGRA. */
++		sweet_surface_set_splash_pool(fPhys, 24u << 20, (24u << 20) / 2);
++		fFlipMode = 1;
++		PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
++		/*
++		 * The carve-out only holds one CA surface, but CoreAnimation keeps
++		 * two or three in rotation; without contiguous slots for all of
++		 * them only every other frame could flip, and the frames that fell
++		 * back to a copy were invisible (the DPU was still scanning the
++		 * flipped surface).
++		 */
++		if (fFlipMode != 0) {
++			uint32_t slots = 3;
++
++			PE_parse_boot_argn("sweetfb_flipslots", &slots, sizeof(slots));
++			sweet_surface_flip_pool((24u << 20) / 2, slots);
++		}
++	}
++	if (fCacheMode != 0 && fSurface != NULL) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
++		fMap = md != NULL ? md->map(kIOMapCopybackCache) : NULL;
++		OSSafeReleaseNULL(md);
++		if (fMap != NULL && fMap->getVirtualAddress() != 0) {
++			fPixels = (uintptr_t)fMap->getVirtualAddress();
++			IOLog("SWEET FB: panel copy through a cached mapping + cvac\n");
++		} else {
++			fCacheMode = 0;
++			IOLog("SWEET FB: cached panel mapping failed, keeping write-combined\n");
++			OSSafeReleaseNULL(fMap);
++		}
++	}
++	fWorkLoop = IOWorkLoop::workLoop();
++	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++		IOLog("SWEET FB: setup failed\n");
++		OSSafeReleaseNULL(fMap);
++		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
++		OSSafeReleaseNULL(fWorkLoop);
++		return false;
++	}
++	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
++	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
++		IOLog("SWEET FB: no vsync timer\n");
++		return false;
++	}
++	uint32_t hz = 60;
++	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	fPeriodUS = (hz == 0 || hz > 240) ? SWEET_FB_VSYNC_US : 1000000u / hz;
++	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/*
++	 * The panel copy gets its own work loop and timer, so the vsync
++	 * notifications above stay on time whatever a copy costs.
++	 */
++	fPresentLoop = IOWorkLoop::workLoop();
++	fPresentTimer = fPresentLoop != NULL ?
++	    IOTimerEventSource::timerEventSource(this, &AppleCLCD::presentFired) : NULL;
++	if (fPresentTimer == NULL ||
++	    fPresentLoop->addEventSource(fPresentTimer) != kIOReturnSuccess) {
++		IOLog("SWEET FB: no present timer\n");
++		return false;
++	}
++	fPresentTimer->setTimeoutUS(fPeriodUS);
++
++	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
++	setProperty("external", false);
++	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	registerService();
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, "
++	    "presented as %ux%u, present every %u us, panel %s, flip %s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS,
++	    fCacheMode != 0 ? "cached" : "write-combined",
++	    fFlipMode != 0 ? "on" : "off");
++	/* Discover the live SSPP; enables sweet_display_flip when found. */
++	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
++	if (fFlipMode != 0 && !sweet_display_can_flip()) {
++		IOLog("SWEET FB: sweetfb_flip=1 but DPU layer not found, CPU copy stays\n");
++	}
++	return true;
++}
++
++void
++AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	uint64_t now = mach_absolute_time();
++	uint64_t count = ++fb->fVsyncCount;
++	uint64_t values[6] = {
++		(uint32_t)count, (uint32_t)(count >> 32),
++		(uint32_t)now, (uint32_t)(now >> 32),
++		0, 0,
++	};
++
++	IOLockLock(fb->fLock);
++	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client =
++		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
++		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
++	}
++	IOLockUnlock(fb->fLock);
++	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++}
++
++/* Microseconds since start, for the present cost report. */
++static uint32_t
++sweet_fb_elapsed_us(uint64_t start)
++{
++	uint64_t delta = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &delta);
++	return delta > 1000000000ULL ? 1000000000u : (uint32_t)(delta / 1000);
++}
++
++/*
++ * Clean the lines of a just-written panel region: the display controller is
++ * not cache coherent. dc cvac (clean, keep the line) rather than civac, so a
++ * dirty line someone else holds through another mapping is not discarded.
++ */
++static void
++sweet_fb_clean_rows(uintptr_t dst, size_t row, int32_t h, uint32_t stride)
++{
++	uint64_t ctr;
++	size_t line;
++
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	line = (size_t)4 << ((ctr >> 16) & 0xf);
++	for (int32_t y = 0; y < h; y++) {
++		uintptr_t start = dst + (uint64_t)y * stride;
++		uintptr_t p = start & ~(uintptr_t)(line - 1);
++		uintptr_t end = start + row;
++
++		for (; p < end; p += line) {
++			__asm__ volatile ("dc cvac, %0" :: "r"(p) : "memory");
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Panel copy, on its own work loop. The period follows the measured cost:
++ * a copy may use about a third of the frame period, so a slow mapping
++ * (write-combined stores run at a few GB/s at best) costs update rate
++ * instead of CPU. sweetfb_hz caps the rate from above.
++ */
++void
++AppleCLCD::presentFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	bool dirty, off;
++	uint32_t step, period;
++
++	IOLockLock(fb->fLock);
++	dirty = fb->fDirty;
++	if (dirty) {
++		memcpy(rec, fb->fPending, sizeof(rec));
++		fb->fDirty = false;
++	}
++	off = fb->fPowerOff;
++	step = fb->fFadeStep;
++	if (off && step <= 6) {
++		fb->fFadeStep = step + 1;
++	}
++	IOLockUnlock(fb->fLock);
++
++	if (off) {
++		/* Fade must hit the buffer the DPU is scanning. */
++		if (step == 0 && fb->fFlipMode != 0) {
++			sweet_display_flip_reset();
++		}
++		/* Fade out: halve every channel each step, then black, then idle. */
++		if (step <= 6) {
++			for (uint32_t y = 0; y < fb->fHeight; y++) {
++				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels +
++				    (uint64_t)y * fb->fRowBytes);
++				for (uint32_t x = 0; x < fb->fWidth; x++) {
++					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++				}
++			}
++			if (fb->fCacheMode != 0) {
++				sweet_fb_clean_rows(fb->fPixels, (size_t)fb->fWidth * 4,
++				    (int32_t)fb->fHeight, fb->fRowBytes);
++			}
++		}
++	} else if (dirty) {
++		uint64_t start = mach_absolute_time();
++		fb->fFrameBytes = 0;
++		fb->present(rec);
++		fb->fCopyUs = sweet_fb_elapsed_us(start);
++		fb->fPresents++;
++	}
++
++	period = fb->fPeriodUS;
++	if (fb->fCopyUs * 3 > (uint64_t)period) {
++		uint64_t want = fb->fCopyUs * 3;
++		period = (uint32_t)(want > 50000 ? 50000 : want);
++	}
++	if ((fb->fPresents % 120) == 0 && fb->fPresents != 0) {
++		uint64_t mbps = fb->fCopyUs != 0 ?
++		    (fb->fFrameBytes * 1000000ULL) / (fb->fCopyUs * (1024ULL * 1024ULL)) : 0;
++		IOLog("SWEET FB: present %llu %u us %llu KB %llu MB/s every %u us "
++		    "(flips %llu)\n",
++		    (unsigned long long)fb->fPresents, (uint32_t)fb->fCopyUs,
++		    (unsigned long long)(fb->fFrameBytes / 1024),
++		    (unsigned long long)mbps, period,
++		    (unsigned long long)fb->fFlips);
++	}
++	sender->setTimeoutUS(period);
++}
++
++void
++AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
++{
++	IOLockLock(fLock);
++	fClients->setObject(client);
++	IOLockUnlock(fLock);
++}
++
++void
++AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
++{
++	IOLockLock(fLock);
++	unsigned int i = fClients->getNextIndexOfObject(client, 0);
++	if (i != (unsigned int)-1) {
++		fClients->removeObject(i);
++	}
++	IOLockUnlock(fLock);
++}
++
++static uint32_t
++get32(const uint8_t *p, uint32_t off)
++{
++	uint32_t v;
++	memcpy(&v, p + off, 4);
++	return v;
++}
++
++static uint32_t sweet_fb_swaps_logged;
++static uint64_t sweet_fb_swap_count;
++
++/*
++ * A swap only records the frame: copying 10 MB into the panel on every swap
++ * (backboardd presents at 60 Hz) took the whole CPU, and doing it on the
++ * vsync work loop also delayed the notifications back to CoreAnimation.
++ * presentFired() does the copy and the cost report; swap() stays a small
++ * memcpy under the lock.
++ */
++void
++AppleCLCD::swap(const uint8_t *rec)
++{
++	IOLockLock(fLock);
++	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fDirty = true;
++	IOLockUnlock(fLock);
++	if ((++sweet_fb_swap_count % 1000) == 0) {
++		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
++	}
++}
++
++/*
++ * Zero-copy present: point the live SSPP at the CA surface and let the DPU
++ * fetch it. The bootloader's pipeline is kept (same format, same panel-sized
++ * source window, same mixers); only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY move,
++ * so a bad guess costs one frame instead of the panel - and sweet_display_*
++ * restores the splash buffer and disables the flip if the write does not
++ * latch.
++ *
++ * The window is exactly the one the CPU crop-copy below uses: a full panel
++ * rect, cropped out of a larger logical surface when CoreAnimation draws
++ * 1125x2436 for the 1080x2340 panel. That is what makes native and logical
++ * mode flip the same way, and it is why the surface pitch (4320/4352/4608)
++ * must be programmed as YSTRIDE instead of the ABL's 4320.
++ */
++static bool
++sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	uint32_t found = 0, id = 0;
++	int32_t sx, sy, ldx, ldy, lw, lh;
++	uint32_t crop_x, crop_y;
++	const uint8_t *a, *b;
++	SweetSurface *s;
++	uint64_t phys;
++	uintptr_t src;
++	static uint32_t flip_logged;
++
++	if (fb->fFlipMode == 0 || !sweet_display_can_flip()) {
++		return false;
++	}
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if (!(mask & (1u << layer))) {
++			continue;
++		}
++		id = get32(rec, 0x54 + 4 * layer);
++		if (id == 0) {
++			continue;
++		}
++		found++;
++		if (found > 1) {
++			return false;
++		}
++		a = rec + 0x64 + 16 * layer;
++		b = rec + 0xc4 + 16 * layer;
++		sx = (int32_t)get32(a, 0);
++		sy = (int32_t)get32(a, 4);
++		ldx = (int32_t)get32(b, 0);
++		ldy = (int32_t)get32(b, 4);
++		lw = (int32_t)get32(b, 8);
++		lh = (int32_t)get32(b, 12);
++	}
++	if (found != 1) {
++		return false;
++	}
++	s = sweet_surface_copy(id);
++	if (s == NULL || s == fb->fSurface) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	if (lw <= 0 || lh <= 0) {
++		lw = (int32_t)s->width;
++		lh = (int32_t)s->height;
++	}
++	if (sx < 0 || sy < 0 ||
++	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
++		s->release();
++		return false;
++	}
++
++	crop_x = 0;
++	crop_y = 0;
++	if (ldx == 0 && ldy == 0 &&
++	    lw == (int32_t)fb->fLogicalW && lh == (int32_t)fb->fLogicalH &&
++	    sx == 0 && sy == 0 &&
++	    s->width >= fb->fOffX + (int32_t)fb->fWidth &&
++	    s->height >= fb->fOffY + (int32_t)fb->fHeight) {
++		/* Logical-size layer: the panel is its centered window. */
++		crop_x = (uint32_t)fb->fOffX;
++		crop_y = (uint32_t)fb->fOffY;
++	} else if (ldx == fb->fOffX && ldy == fb->fOffY &&
++	    lw == (int32_t)fb->fWidth && lh == (int32_t)fb->fHeight &&
++	    s->width >= (uint32_t)sx + fb->fWidth &&
++	    s->height >= (uint32_t)sy + fb->fHeight) {
++		/* Dest is the panel itself; the record may still offset the source. */
++		crop_x = (uint32_t)sx;
++		crop_y = (uint32_t)sy;
++	} else {
++		s->release();
++		return false;
++	}
++
++	phys = sweet_surface_phys(s);
++	src = s->kernelAddress();
++	if (phys == 0 || phys > 0xffffffffull || src == 0) {
++		s->release();
++		return false;
++	}
++	if (s->bytesPerRow == 0 || s->bytesPerRow > 0xffffu) {
++		s->release();
++		return false;
++	}
++	if (s->memory == NULL ||
++	    (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
++		s->release();
++		return false;
++	}
++	sweet_fb_clean_rows(src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
++	    (uint64_t)crop_x * 4u, (size_t)fb->fWidth * 4u,
++	    (int32_t)fb->fHeight, s->bytesPerRow);
++	if (!sweet_display_flip((uint32_t)phys, s->bytesPerRow, crop_x, crop_y,
++	    fb->fWidth, fb->fHeight)) {
++		s->release();
++		return false;
++	}
++	fb->fFlips++;
++	fb->fFrameBytes = 0;
++	if (flip_logged < 8) {
++		flip_logged++;
++		IOLog("SWEET FB: flip surface %u pa 0x%llx crop %u,%u stride %u "
++		    "panel %ux%u\n",
++		    s->id, (unsigned long long)phys, crop_x, crop_y,
++		    s->bytesPerRow, fb->fWidth, fb->fHeight);
++	}
++	s->release();
++	return true;
++}
++
++/*
++ * Hot path when flip cannot run: CA's 1125x2436 layer -> copy only the
++ * centered panel window into the ABL buffer the DPU already scans.
++ * Beats the generic clipper (less branches, one tight row loop).
++ */
++static bool
++sweet_fb_try_crop_copy(AppleCLCD *fb, const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	uint32_t found = 0, id = 0;
++	int32_t sx, sy, ldx, ldy, lw, lh;
++	uint32_t crop_x, crop_y;
++	const uint8_t *a, *b;
++	SweetSurface *s;
++	uintptr_t src, dst;
++	const uint8_t *from;
++	size_t row;
++	static uint32_t crop_logged;
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if (!(mask & (1u << layer))) {
++			continue;
++		}
++		id = get32(rec, 0x54 + 4 * layer);
++		if (id == 0) {
++			continue;
++		}
++		found++;
++		if (found > 1) {
++			return false;
++		}
++		a = rec + 0x64 + 16 * layer;
++		b = rec + 0xc4 + 16 * layer;
++		sx = (int32_t)get32(a, 0);
++		sy = (int32_t)get32(a, 4);
++		ldx = (int32_t)get32(b, 0);
++		ldy = (int32_t)get32(b, 4);
++		lw = (int32_t)get32(b, 8);
++		lh = (int32_t)get32(b, 12);
++	}
++	if (found != 1 || fb->fPixels == 0) {
++		return false;
++	}
++	s = sweet_surface_copy(id);
++	if (s == NULL || s == fb->fSurface) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	if (lw <= 0 || lh <= 0) {
++		lw = (int32_t)s->width;
++		lh = (int32_t)s->height;
++	}
++	if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
++		s->release();
++		return false;
++	}
++
++	if (ldx == 0 && ldy == 0 &&
++	    lw == (int32_t)fb->fLogicalW && lh == (int32_t)fb->fLogicalH &&
++	    sx == 0 && sy == 0) {
++		crop_x = (uint32_t)fb->fOffX;
++		crop_y = (uint32_t)fb->fOffY;
++	} else if (ldx == fb->fOffX && ldy == fb->fOffY &&
++	    lw == (int32_t)fb->fWidth && lh == (int32_t)fb->fHeight) {
++		crop_x = (uint32_t)sx;
++		crop_y = (uint32_t)sy;
++	} else {
++		s->release();
++		return false;
++	}
++	if (s->width < crop_x + fb->fWidth || s->height < crop_y + fb->fHeight) {
++		s->release();
++		return false;
++	}
++	src = s->kernelAddress();
++	if (src == 0) {
++		s->release();
++		return false;
++	}
++
++	row = (size_t)fb->fWidth * 4u;
++	dst = fb->fPixels;
++	from = (const uint8_t *)(src + s->offset +
++	    (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u);
++	if (s->bytesPerRow == fb->fRowBytes && crop_x == 0) {
++		memcpy((void *)dst, from, row * (size_t)fb->fHeight);
++	} else {
++		for (uint32_t y = 0; y < fb->fHeight; y++) {
++			memcpy((void *)(dst + (uint64_t)y * fb->fRowBytes),
++			    from + (uint64_t)y * s->bytesPerRow, row);
++		}
++	}
++	fb->fFrameBytes = (uint64_t)row * fb->fHeight;
++	if (fb->fCacheMode != 0) {
++		sweet_fb_clean_rows(dst, row, (int32_t)fb->fHeight, fb->fRowBytes);
++	}
++	if (crop_logged < 4) {
++		crop_logged++;
++		IOLog("SWEET FB: crop-copy surface %u %ux%u -> panel %ux%u "
++		    "(%u KB)\n",
++		    s->id, s->width, s->height, fb->fWidth, fb->fHeight,
++		    (uint32_t)(fb->fFrameBytes / 1024u));
++	}
++	s->release();
++	return true;
++}
++
++/* Copy each enabled layer's surface into the panel memory (no scaling). */
++void
++AppleCLCD::present(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++
++	if (!fConsolePaused) {
++		int quiet = 0;
++		fConsolePaused = true;
++		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++			/* Not PE_initialize_console(kPEDisableScreen): its console switch
++			 * writes the read-only-late cons_ops_index and panics. */
++			sweet_console_muted = 1;
++		}
++	}
++
++	if (sweet_fb_try_flip(this, rec)) {
++		return;
++	}
++	/*
++	 * A previous frame may have left the plane on a CA surface. Point it back
++	 * at the splash buffer before copying into it, or this frame would paint
++	 * memory nobody scans out (and the panel would freeze on the old flip).
++	 * Cheap no-op when the plane was never moved.
++	 */
++	sweet_display_flip_reset();
++	if (sweet_fb_try_crop_copy(this, rec)) {
++		return;
++	}
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		const uint8_t *a = rec + 0x64 + 16 * layer;
++		const uint8_t *b = rec + 0xc4 + 16 * layer;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (sweet_fb_swaps_logged < 16) {
++			sweet_fb_swaps_logged++;
++			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
++			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
++			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
++			    get32(a, 12), dx, dy, w, h);
++		}
++		if (s == NULL || s == fSurface) {
++			OSSafeReleaseNULL(s);
++			continue;
++		}
++		uintptr_t src = s->kernelAddress();
++		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (w <= 0 || h <= 0) {
++			w = (int32_t)s->width;
++			h = (int32_t)s->height;
++		}
++		if (sx < 0 || sy < 0) {
++			sx = sy = 0;
++		}
++		if (dx < 0 || dy < 0) {
++			dx = dy = 0;
++		}
++		/* Logical (presented) display coordinates -> panel coordinates. */
++		dx -= fOffX;
++		dy -= fOffY;
++		if (dx < 0) {
++			sx -= dx;
++			w += dx;
++			dx = 0;
++		}
++		if (dy < 0) {
++			sy -= dy;
++			h += dy;
++			dy = 0;
++		}
++		if (w > (int32_t)s->width - sx) {
++			w = (int32_t)s->width - sx;
++		}
++		if (h > (int32_t)s->height - sy) {
++			h = (int32_t)s->height - sy;
++		}
++		if (w > (int32_t)fWidth - dx) {
++			w = (int32_t)fWidth - dx;
++		}
++		if (h > (int32_t)fHeight - dy) {
++			h = (int32_t)fHeight - dy;
++		}
++		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++		    (uint64_t)(sx + w) * 4;
++		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++		    s->memory == NULL || last > s->memory->getLength()) {
++			src = 0;
++		}
++		if (src != 0 && bpe == 4) {
++			size_t row = (size_t)w * 4;
++			uintptr_t dst = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++			const uint8_t *from = (const uint8_t *)(src + s->offset +
++			    (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4);
++
++			fFrameBytes += (uint64_t)row * (uint64_t)h;
++			if (row == fRowBytes && row == s->bytesPerRow) {
++				/* Full-width layer: one big memcpy beats per-row calls. */
++				memcpy((void *)dst, from, row * (size_t)h);
++			} else {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(dst + (uint64_t)y * fRowBytes),
++					    from + (uint64_t)y * s->bytesPerRow, row);
++				}
++			}
++			if (fCacheMode != 0) {
++				sweet_fb_clean_rows(dst, row, h, fRowBytes);
++			}
++		}
++		s->release();
++	}
++}
++
++bool
++IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	return true;
++}
++
++bool
++IOMobileFramebufferUserClient::start(IOService *provider)
++{
++	fFB = OSDynamicCast(AppleCLCD, provider);
++	if (fFB == NULL || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fFB->addClient(this);
++	return true;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::clientClose(void)
++{
++	if (fFB != NULL) {
++		fFB->removeClient(this);
++		IOLockLock(fFB->fLock);
++		mach_port_t old = fPort;
++		fPort = MACH_PORT_NULL;
++		IOLockUnlock(fFB->fLock);
++		if (old != MACH_PORT_NULL) {
++			releaseNotificationPort(old);
++		}
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, __unused UInt32 type,
++    __unused io_user_reference_t refCon)
++{
++	mach_port_t old;
++	IOLockLock(fFB->fLock);
++	old = fPort;
++	fPort = port;
++	IOLockUnlock(fFB->fLock);
++	if (old != MACH_PORT_NULL) {
++		releaseNotificationPort(old);
++	}
++	return kIOReturnSuccess;
++}
++
++/* Called with the framebuffer lock held. */
++void
++IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uint32_t count)
++{
++	OSAsyncReference64 ref;
++
++	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
++		return;
++	}
++	bzero(ref, sizeof(ref));
++	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
++	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
++	    kIOUserNotifyOptionCanDrop);
++}
++
++static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++
++IOReturn
++IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t out[2] = { 0, 0 };
++	uint32_t outCount = 0;
++
++	switch (selector) {
++	case kSweetFBGetLayerDefaultSurface:
++		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
++		outCount = 1;
++		break;
++	case kSweetFBSwapBegin:
++		IOLockLock(fFB->fLock);
++		out[0] = ++fFB->fSwapID;
++		IOLockUnlock(fFB->fLock);
++		outCount = 1;
++		break;
++	case kSweetFBSwapEnd: {
++		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++		if (args->structureInputDescriptor != NULL ||
++		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(rec, args->structureInput, sizeof(rec));
++		fFB->swap(rec);
++		break;
++	}
++	case kSweetFBGetID:
++		out[0] = 0;
++		outCount = 1;
++		break;
++	case kSweetFBGetDisplaySize:
++		out[0] = fFB->fLogicalW;
++		out[1] = fFB->fLogicalH;
++		outCount = 2;
++		break;
++	case kSweetFBIsMainDisplay:
++		out[0] = 1;
++		outCount = 1;
++		break;
++	case kSweetFBGetDotPitch:
++		out[0] = SWEET_FB_DOT_PITCH;
++		outCount = 1;
++		break;
++	case kSweetFBNotifications:
++		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
++			uint32_t type = (uint32_t)args->scalarInput[2];
++			IOLockLock(fFB->fLock);
++			fFunc[type] = args->scalarInput[0];
++			fRefcon[type] = args->scalarInput[1];
++			IOLockUnlock(fFB->fLock);
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET FB: %s notifications type %u %s\n", name, type,
++			    args->scalarInput[0] ? "on" : "off");
++		}
++		break;
++	case kSweetFBRequestPowerChange:
++		if (args->scalarInputCount >= 1) {
++			bool off = args->scalarInput[0] == 0;
++			IOLockLock(fFB->fLock);
++			if (off != fFB->fPowerOff) {
++				fFB->fPowerOff = off;
++				fFB->fFadeStep = 0;
++				fFB->fDirty = true;     /* on: redraw the latest frame */
++			}
++			IOLockUnlock(fFB->fLock);
++			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++		}
++		break;
++	case kSweetFBSwapWait: {
++		/*
++		 * Returns at once: whether CoreAnimation passes a swap id (and a
++		 * timeout) here decides whether blocking would pace the present
++		 * loop better. Log the first calls, do not guess the ABI.
++		 */
++		static uint32_t sweet_fb_wait_logged;
++		if (sweet_fb_wait_logged < 8) {
++			sweet_fb_wait_logged++;
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET FB: %s SwapWait in %u %llu %llu %llu (presented %llu)\n",
++			    name, args->scalarInputCount,
++			    args->scalarInputCount > 0 ? (unsigned long long)args->scalarInput[0] : 0ULL,
++			    args->scalarInputCount > 1 ? (unsigned long long)args->scalarInput[1] : 0ULL,
++			    args->scalarInputCount > 2 ? (unsigned long long)args->scalarInput[2] : 0ULL,
++			    (unsigned long long)fFB->fPresents);
++		}
++		break;
++	}
++	default:
++		break;
++	}
++
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = i < outCount ? out[i] : 0;
++	}
++	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			sweet_fb_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize, ret);
++	}
++	return ret;
++}
++#endif /* SWEET */
