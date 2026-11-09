@@ -532,6 +532,31 @@ dpu_restore(void)
 }
 
 /*
+ * Dump the live SSPP once, right after the first flip. The boot probe dumped
+ * the same block before any write, so comparing the two shows what a flip
+ * leaves behind and whether the words this driver never touches - pixel
+ * extension at 0x100, the scaler-era values at 0x0c0..0x0fc, CDP/QOS at
+ * 0x130..0x158 - still hold the bootloader's own configuration.
+ */
+static void
+dpu_dump_sspp(void)
+{
+	uint32_t n = 0;
+
+	for (uint32_t off = 0; off < 0x1f0u; off += 4) {
+		uint32_t v = dpu_rd(g_dpu.mdss, g_dpu.sspp_off + off);
+
+		if (v == 0) {
+			continue;
+		}
+		n++;
+		IOLog("SWEET DPU: after flip sspp+0x%03x=0x%08x\n", off, v);
+	}
+	IOLog("SWEET DPU: after flip sspp+0x000..0x1ec, %u nonzero words\n",
+	    n);
+}
+
+/*
  * Point the live SSPP at phys (32-bit PA) with the given bytes-per-row and a
  * source window (origin inside that buffer, size in pixels).
  *
@@ -619,6 +644,9 @@ sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
 		    dpu_rd(g_dpu.mdss, g_dpu.out_xy_off),
 		    dpu_rd(g_dpu.mdss, g_dpu.src_stride_off),
 		    wrote_size ? " (window programmed)" : "");
+		if (g_dpu.flips_logged == 1) {
+			dpu_dump_sspp();
+		}
 	}
 	g_dpu.cur_pa = phys;
 	g_dpu.dirty = 1;

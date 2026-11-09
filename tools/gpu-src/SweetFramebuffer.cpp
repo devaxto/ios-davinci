@@ -477,18 +477,19 @@ AppleCLCD::swap(const uint8_t *rec)
 }
 
 /*
- * 0103 diagnostics. A flipped frame comes out as noise for one of two very
- * different reasons: the surface the plane was pointed at never held a frame
- * (the renderer draws somewhere else, or not yet), or the plane does not
- * fetch what the CPU can read at that physical address and pitch.
+ * 0103/0104 diagnostics. A flipped frame comes out as noise for one of two
+ * very different reasons: the surface the plane was pointed at never held a
+ * frame (the renderer draws somewhere else, or not yet), or the plane does
+ * not fetch what the CPU can read at that physical address and pitch.
  * sweetfb_probe=N logs what the surface holds (zero/opaque counts, a few
- * pixels per row) and sweetfb_fetchtest=N replaces the next N flips with the
- * panel buffer's own content plus colour bands: those bands on the panel
- * prove the address, pitch and window of the fetch, whatever CoreAnimation
- * had put in the surface.
+ * pixels per row) and sweetfb_chart=N replaces the next N flips with a
+ * twelve-band colour chart framed by 8 px rulers: the chart is what tells the
+ * two apart. Twelve bands and four rulers mean the fetch is 1:1 whatever was
+ * there before; four bands mean the plane is scanning a third of the source;
+ * no chart at all means this address is not what the panel shows.
  */
 static int32_t sweet_fb_probe_left = -1;
-static int32_t sweet_fb_fetchtest_left = -1;
+static int32_t sweet_fb_chart_left = -1;
 
 static uint32_t
 sweet_fb_boot_u32(const char *name, uint32_t def)
@@ -548,41 +549,39 @@ sweet_fb_probe_surface(const uint8_t *base, uint32_t bpr, uint32_t w,
 }
 
 /*
- * Overwrite the frame the plane is about to fetch with content the DPU
- * already scans correctly (the panel buffer), plus markers: 100 blue rows at
- * the top, green at the middle, red at the bottom, and a red bar down the
- * left edge. Markers that arrive sheared or repeated mean the fetch pitch or
- * window is wrong; no markers at all mean this address is not fetched.
+ * Twelve horizontal bands in a fixed colour order (red at the top, black at
+ * the bottom) with 8 px white rulers on all four edges. Anything the plane
+ * shows that is not these twelve bands in this order is not the buffer at the
+ * address and pitch we programmed:
+ *
+ *  12 bands + 4 rulers  fetch is 1:1, the earlier noise was buffer content
+ *  4 bands + no rulers  the plane scans a third of the source (a scaler)
+ *  bands, no rulers     pitch or window is off
+ *  no bands             this address is not what the panel shows
+ *
+ * The bands are written over the whole surface, so the answer does not
+ * depend on what CoreAnimation had drawn there.
  */
-static void
-sweet_fb_fetchtest(uint8_t *dst, uint32_t bpr, uint32_t w, uint32_t h,
-    const uint8_t *panel, uint32_t panel_stride)
-{
-	size_t row = (size_t)w * 4u;
+static const uint32_t kChartBands[12] = {
+	0xff0000ffu, 0xff00ff00u, 0xffff0000u, 0xffffffffu,
+	0xff00ffffu, 0xffffff00u, 0xffff00ffu, 0xff0080ffu,
+	0xffff0080u, 0xff808080u, 0xff202020u, 0xff000000u,
+};
 
-	for (uint32_t y = 0; y < h; y++) {
-		memcpy(dst + (uint64_t)y * bpr,
-		    panel + (uint64_t)y * panel_stride, row);
-	}
+static void
+sweet_fb_chart(uint8_t *dst, uint32_t bpr, uint32_t w, uint32_t h)
+{
 	for (uint32_t y = 0; y < h; y++) {
 		uint32_t *p = (uint32_t *)(dst + (uint64_t)y * bpr);
-		bool full = (y < 100u || (y >= 1000u && y < 1100u) ||
-		    y >= h - 100u);
+		uint32_t v = kChartBands[(uint64_t)y * 12u / h];
+		bool ruler = (y < 8u || y + 8u >= h);
 
-		if (full) {
-			uint32_t mark = y < 100u ? 0xffff0000u :
-			    (y < 1100u ? 0xff00ff00u : 0xff0000ffu);
-
-			for (uint32_t x = 0; x < w; x++) {
-				p[x] = mark;
-			}
-		}
-		for (uint32_t x = 0; x < 24u && x < w; x++) {
-			p[x] = 0xff0000ffu;
+		for (uint32_t x = 0; x < w; x++) {
+			p[x] = (ruler || x < 8u || x + 8u >= w) ? 0xffffffffu : v;
 		}
 	}
-	IOLog("SWEET FB: fetchtest %ux%u bpr %u <- panel stride %u, bands "
-	    "painted\n", w, h, bpr, panel_stride);
+	IOLog("SWEET FB: chart %ux%u bpr %u, 12 bands + 8 px white rulers\n",
+	    w, h, bpr);
 }
 
 /*
@@ -693,8 +692,8 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 	}
 	if (sweet_fb_probe_left < 0) {
 		sweet_fb_probe_left = (int32_t)sweet_fb_boot_u32("sweetfb_probe", 3);
-		sweet_fb_fetchtest_left =
-		    (int32_t)sweet_fb_boot_u32("sweetfb_fetchtest", 0);
+		sweet_fb_chart_left =
+		    (int32_t)sweet_fb_boot_u32("sweetfb_chart", 0);
 	}
 	if (sweet_fb_probe_left > 0) {
 		sweet_fb_probe_left--;
@@ -702,12 +701,11 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		    (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u),
 		    s->bytesPerRow, fb->fWidth, fb->fHeight);
 	}
-	if (sweet_fb_fetchtest_left > 0) {
-		sweet_fb_fetchtest_left--;
-		sweet_fb_fetchtest((uint8_t *)(src + s->offset +
+	if (sweet_fb_chart_left > 0) {
+		sweet_fb_chart_left--;
+		sweet_fb_chart((uint8_t *)(src + s->offset +
 		    (uint64_t)crop_y * s->bytesPerRow + (uint64_t)crop_x * 4u),
-		    s->bytesPerRow, fb->fWidth, fb->fHeight,
-		    (const uint8_t *)fb->fPixels, fb->fRowBytes);
+		    s->bytesPerRow, fb->fWidth, fb->fHeight);
 	}
 	sweet_fb_clean_rows(src + s->offset + (uint64_t)crop_y * s->bytesPerRow +
 	    (uint64_t)crop_x * 4u, (size_t)fb->fWidth * 4u,

@@ -176,6 +176,28 @@ register:
   mean the fetch geometry is wrong; no markers mean that physical address is
   not fetched at all.
 
+### 0104 — the colour chart (`sweetfb_chart`) and the pipe after a flip
+
+0103 answered the first question and left the second one: the surface held a
+fully opaque black frame with one white detail at the centre (a plausible early
+boot screen), yet none of the 0103 markers ever reached the panel, with every
+plane register reading back as written. Replaced by:
+
+- `sweetfb_chart=N` (default 0, off): for the first N flips, paint twelve solid
+  horizontal bands over the whole surface - red, green, blue, white, yellow,
+  cyan, magenta, orange, violet, grey, dark grey, black - framed by 8 px white
+  rulers on all four edges (`SWEET FB: chart`). Read the panel, not the log: 12
+  bands plus 4 rulers means the fetch is 1:1; 4 bands and no rulers means
+  something scales a third of the source; bands with no rulers means the pitch
+  or the window is wrong; no bands at all means the address the plane was given
+  is not what the panel shows.
+- `SWEET DPU: after flip sspp+0xNNN=0x...`: the live SSPP block dumped once,
+  right after the first flip, so it can be diffed against the boot probe's dump
+  of the same words. The registers this driver never writes (pixel extension at
+  0x100, the `0x0c0..0x0fc` block, CDP/QOS at 0x130..0x158) show whether the
+  bootloader left a scaler or pixel-extension state that a panel-sized source
+  window does not reset.
+
 ### After the flip: hardware layers
 
 The DPU scans several SSPPs into one mixer with per-stage blending. Once a
