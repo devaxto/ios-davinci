@@ -2,6 +2,78 @@
 
 ## Agent handoff / active work (2026-11-08, latest)
 
+### >>> UPDATE 2026-11-09 ~22:40 - 0103 log read: the surface is a black frame, the panel ignores its markers <<<
+
+1. **`logs/boot-0103-feel.txt`** (4,198,400 B read, ring 4,194,304, total
+   405,556 B, flush #25, 7,780 lines) pulled from OrangeFox after booting
+   `shim/out/shim-boot-0103-feel.img` (`sweetfb_probe=3 sweetfb_fetchtest=4`).
+2. **The CA surface holds a real (if nearly empty) frame, not garbage:**
+   `SWEET FB: probe 1080x2340 bpr 4352 9996 samples, 0 zero, 9996 opaque,
+   first 0xff000000 last 0xff000000`, top and last rows all `0xff000000`, mid
+   row `0xff000000 0xff000000 0xffffffff 0xff000000` (same numbers again on
+   flip 3). So the pool buffer is a fully opaque black frame with a small white
+   detail at the horizontal centre - a plausible early boot screen. Hypothesis
+   "CA's content never reaches the flip pool" is dead (`SweetSurface.cpp`
+   allocates contiguous below-4 GB memory, `bzero`s it, and CA maps the same
+   descriptor; `sweet_surface_phys()` = physAddr + offset).
+3. **The flip still latches exactly as in 0102:** flips 1-8 on
+   `0xb3350000`/`0xb3f50000`, stride 4352, win 1080x2340 at 0,0, YSTRIDE
+   `0x00001100`, `SRC_SIZE`/`OUT_SIZE` `0x09240438`, `SRC_XY` 0, no "flip did
+   not stick", no crop-copy. CA then stops after `swap 8` (as in 0102);
+   SpringBoard, duetexpertd, AccessibilityUIServer, touch and AKS traffic
+   continue for the rest of the log.
+4. **The panel photo disagrees with the buffer:** black screen, a thin white
+   full-width line near the top, a full-width white band across the middle
+   third with fine vertical stripes, a red/blue diagonal from the top-left to
+   that band, black below. **None** of the 0103 markers (blue top 100 rows,
+   green at y=1000, red bottom 100 rows, red left 24 px bar) is visible, and
+   the band is at neither y<100, y=1000 nor y>2240.
+5. **So:** registers right + buffer sane + no marker anywhere on the panel ->
+   the plane is not scanning the source rectangle we programmed, or something
+   the driver never writes rescales/skews the fetch. Ruled out by evidence so
+   far: content absent, SRC/OUT size and origin, multirect, pitch (4352 both
+   sides), cache cleaning (already done before each flip), CPU-copy
+   contamination. The words this driver never writes are `0x0c0..0x0fc`
+   (`0x0002c020`, `0x0002c2d6`, `0x000f000f`, `0x00010030`, `0x02e002e0` on
+   vig0 only, which look like QSEED phase steps), `0x100..0x128` (SW_PIX_EXT,
+   `0x09240438` REQ_PIXELS), `0x130..0x158` (CDP/QOS), `0x1bc` SYS_CACHE_MODE
+   = 0x10, and `0x194..0x1a8` (CSC).
+6. **0104** (`xnu/patches/0104-sweet-dpu-chart-and-pipe-dump.patch`, from
+   `tools/gpu-src/SweetFramebuffer.0103.cpp` + `SweetDisplay.0103.cpp`, made by
+   `tools/gpu-src/gen_0104_patch.py`):
+   - `sweetfb_chart=N` (default 0) replaces the panel-copy fetchtest: it paints
+     twelve solid bands over the whole surface - red, green, blue, white,
+     yellow, cyan, magenta, orange, violet, grey, dark grey, black - plus 8 px
+     white rulers on all four edges. 12 bands + 4 rulers = the fetch is 1:1
+     (and the 0103 problem was content); 4 bands, no rulers = something scales
+     a third of the source; bands without rulers = pitch/window; no bands = the
+     panel is not showing that address.
+   - `dpu_dump_sspp()` logs the live SSPP block once right after flip 1
+     (`SWEET DPU: after flip sspp+0xNNN=0x...`) to diff against the boot probe
+     dump and see the untouched words with the surface in place.
+7. **Local gates green:** `clang++.exe -fsyntax-only -Wall -Wextra` on the new
+   helpers + hook (`shim/out/_diag0103_check.cpp`, stub headers, no warnings),
+   `tools/check-patches.py` -> `all patch hunk headers OK` (121,044 B patch),
+   `tools/verify-patch-chain.py 0099 0100 0101 0102 0103 0104` -> `chain OK`.
+8. **CI + artifact + image DONE:** run **42659894924** (commit `da9e7f4`)
+   **success** after one rerun (the first attempt died in the macOS SDK step:
+   `hdiutil: attach failed - image not recognized`, not our patch).
+   `xnu/out-0104/kernel.development.sweet` 17,333,680 B, SHA256
+   `e163ddc6b4a0224807649ebcd975edde932e742cbb29955a8e1f37948ccea7c1`;
+   strings confirm `SWEET FB: chart %ux%u bpr %u`, `after flip sspp+0x%03x`,
+   `after flip sspp+0x000..0x1ec` plus all 0102/0103 strings. Image
+   `shim/out/shim-boot-0104-feel.img` 17,313,792 B, SHA256
+   `ccdc6630a9c995e88bc12914ef4e902a89004ceead0275bc61a64658ece40387` (payload
+   `d96af50e...f94028` 16,722,432 B, adt `sweet-0104.adt` 10,332 B, dtb yes,
+   payload carries `sweetfb_probe=2 sweetfb_chart=8`), built with
+   `python shim/out/_mk0103.py xnu/out-0104/kernel.development.sweet 0104
+   "sweetfb_probe=2 sweetfb_chart=8"` (the helper now takes tag + extra args).
+9. **Next:** `fastboot boot shim/out/shim-boot-0104-feel.img` once. **Look at
+   the panel first** (12 bands + rulers? 4 bands? nothing?), then OrangeFox and
+   `python tools/sweet-log-pull.py logs/boot-0104-feel.txt -s aa20029b`, and
+   diff `SWEET DPU: after flip sspp+0x...` against the boot probe's
+   `vig0+0x...` list for the same boot.
+
 ### >>> UPDATE 2026-11-09 ~20:30 - 0102 log read: registers are right, content is the question <<<
 
 1. **0102 booted 16:51 and the log is pulled.** User photo of the panel:
